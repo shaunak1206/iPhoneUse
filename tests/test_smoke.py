@@ -1,0 +1,279 @@
+"""Offline suite: drives every phone tool through a real FastMCP client against
+tests/fake_mirrorctl.py. No phone, no permissions needed.
+
+    .venv/bin/python tests/test_smoke.py
+"""
+
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TMP = Path(tempfile.mkdtemp(prefix="iphone-mcp-test-"))
+os.environ["IPHONE_MIRRORCTL"] = str(HERE / "fake_mirrorctl.py")
+os.environ["FAKE_STATE"] = str(TMP / "state.json")
+os.environ["FAKE_LOG"] = str(TMP / "calls.log")
+sys.path.insert(0, str(HERE.parent))
+
+from fastmcp import Client  # noqa: E402
+
+from iphone_mcp import screen  # noqa: E402
+from iphone_mcp.bridge import Screen, TextItem  # noqa: E402
+from iphone_mcp.server import build  # noqa: E402
+
+# phone screen origin in global points, and points per phone point
+ORIGIN = (697.0 + 8, 164.0 + 38)
+SCALE = 300 / 390
+failures: list[str] = []
+
+
+def check(cond: bool, label: str, detail: object = "") -> None:
+    print(("  ok   " if cond else "  FAIL ") + label + ("" if cond else f"\n         {detail}"))
+    if not cond:
+        failures.append(label)
+
+
+def set_state(**kw) -> None:
+    p = Path(os.environ["FAKE_STATE"])
+    s = json.loads(p.read_text()) if p.exists() else {
+        "screen": "home", "locked": False, "query": "", "screen_access": True, "running": True}
+    s.update(kw)
+    p.write_text(json.dumps(s))
+
+
+def calls(cmd: str) -> list[list[str]]:
+    log = Path(os.environ["FAKE_LOG"])
+    if not log.exists():
+        return []
+    return [c for c in map(json.loads, log.read_text().splitlines()) if c[0] == cmd]
+
+
+def reset_log() -> None:
+    Path(os.environ["FAKE_LOG"]).write_text("")
+
+
+def text(r) -> str:
+    return "\n".join(c.text for c in r.content if getattr(c, "type", "") == "text")
+
+
+def unit_tests() -> None:
+    print("screen helpers")
+    s = Screen(390, 844, [
+        TextItem("Wi-Fi", 1, 20, 300, 40, 20), TextItem("Home", 1, 300, 302, 50, 16),
+        TextItem("Bluetooth", 1, 20, 360, 80, 20), TextItem("Delete App", 1, 140, 480, 100, 20),
+    ])
+    rows = screen.lines(s)
+    check([len(r) for r in rows] == [2, 1, 1], "rows group by vertical center", rows)
+    d = screen.describe(s)
+    check("(40,310) Wi-Fi   |   (325,310) Home" in d, "describe tags tap points per row", d)
+    check(screen.find(s, "wifi")[0].text == "Wi-Fi" and screen.find(s, "wi-fi", exact=True)[0].text == "Wi-Fi"
+          and screen.find(s, "wifi", exact=True) == [], "find is exact/substring/fuzzy")
+    check(screen.find(s, "Bluetoth")[0].text == "Bluetooth", "fuzzy find tolerates OCR typos")
+    check(screen.risky_label(screen.at(s, 190, 490)) == "Delete App", "risky label detected under point")
+    check(screen.risky_label(screen.at(s, 40, 310)) is None, "benign label passes")
+    s2 = Screen(390, 844, [TextItem("Enter Passcode", 1, 100, 200, 150, 20)])
+    check("Only the user may enter it" in screen.describe(s2), "passcode screens flagged")
+
+    print("prompt detection")
+    perm = Screen(390, 844, [
+        TextItem("Allow \u201cMaps\u201d to use your location?", 1, 70, 300, 250, 20),
+        TextItem("Your location is used to show places near you.", 1, 66, 326, 258, 16),
+        TextItem("Allow Once", 1, 150, 470, 90, 20), TextItem("Allow While Using App", 1, 110, 514, 170, 20),
+        TextItem("Don\u2019t Allow", 1, 150, 558, 90, 20)])
+    p = screen.prompt(perm)
+    check(p is not None and p.title.startswith("Allow \u201cMaps\u201d") and "places near you" in p.message
+          and [b.text for b in p.buttons] == ["Allow Once", "Allow While Using App", "Don\u2019t Allow"],
+          "permission prompt: title, message, stacked buttons", p)
+    check("PROMPT on screen" in screen.describe(perm), "describe flags the prompt")
+    check(screen.needs_confirm(p.buttons[0], p) and screen.needs_confirm(p.buttons[2], p) is None,
+          "granting access needs confirm, declining does not")
+    dele = Screen(390, 844, [
+        TextItem("Delete \u201cInstagram\u201d?", 1, 120, 330, 150, 20),
+        TextItem("Deleting this app will also delete its data.", 1, 60, 356, 270, 16),
+        TextItem("Cancel", 1, 90, 420, 60, 20), TextItem("OK", 1, 260, 420, 30, 20)])
+    p = screen.prompt(dele)
+    ok, cancel = screen.pick(p.buttons, "ok"), screen.pick(p.buttons, "cancel")
+    check(p and ok and cancel and screen.needs_confirm(ok, p) and screen.needs_confirm(cancel, p) is None,
+          "'OK' to a destructive question needs confirm, 'Cancel' does not", p)
+    home = Screen(390, 844, [TextItem(t, 1, x, 130, 50, 14) for t, x in
+                             (("Mail", 20), ("Calendar", 110), ("Photos", 200), ("Camera", 290))]
+                  + [TextItem(t, 1, x, 220, 50, 14) for t, x in (("Clock", 20), ("Settings", 110))])
+    check(screen.prompt(home) is None, "home-screen labels are not a prompt")
+    row = Screen(390, 844, [TextItem("Allow Notifications", 1, 20, 300, 160, 20)])
+    check(screen.needs_confirm(row.items[0], screen.prompt(row)) is None,
+          "a Settings row named Allow is not a grant")
+    nav = Screen(390, 844, [TextItem("Cancel", 1, 16, 60, 60, 20), TextItem("Done", 1, 330, 60, 44, 20)])
+    check(screen.prompt(nav) is None, "nav-bar Cancel/Done is not a prompt")
+
+
+async def tool_tests() -> None:
+    mcp = build()
+    async with Client(mcp) as c:
+        tools = {t.name for t in await c.list_tools()}
+        print(f"tools ({len(tools)})")
+        expected = {"phone_status", "phone_connect", "phone_screenshot", "phone_read_screen", "phone_zoom",
+                    "phone_find", "phone_tap", "phone_long_press", "phone_swipe", "phone_scroll", "phone_type",
+                    "phone_key", "phone_go", "phone_open_app", "phone_wait", "device_info", "device_storage",
+                    "device_apps", "phone_alert", "phone_open_url", "phone_do"}
+        check(expected <= tools, "all tools registered", expected - tools)
+
+        set_state(screen="home")
+        r = text(await c.call_tool("phone_status", {}))
+        check("Ready: yes" in r and "390 x 844 pt" in r, "status ready + phone size", r)
+
+        r = text(await c.call_tool("phone_read_screen", {}))
+        check("(60,137) Settings" in r, "read_screen lists items with centers", r)
+
+        reset_log()
+        r = text(await c.call_tool("phone_open_app", {"name": "Settings"}))
+        check("Opened 'Settings'" in r and "General" in r, "open_app via Spotlight lands in app", r)
+        check(["menu", "Spotlight"] in calls("menu") and calls("type")[0][1] == "Settings", "spotlight + typed name")
+
+        reset_log()
+        r = text(await c.call_tool("phone_tap", {"text": "general"}))
+        check("Tapped 'General'" in r and "iPhone Storage" in r, "tap by text navigates", r)
+        click = calls("click")[0]
+        gx, gy = float(click[1]), float(click[2])
+        check(abs(gx - (ORIGIN[0] + 95 * SCALE)) < 1 and abs(gy - (ORIGIN[1] + 410 * 650 / 844)) < 1,
+              "phone points map onto the window", click)
+        check(calls("activate") and calls("restore")[0][1] == "4242" and calls("warp")[0][1:] == ["10.0", "20.0"],
+              "focus and cursor handed back to the user", (calls("activate"), calls("restore"), calls("warp")))
+
+        await c.call_tool("phone_tap", {"text": "iPhone Storage"})
+        reset_log()
+        r = text(await c.call_tool("phone_tap", {"text": "Delete App"}))
+        check(r.startswith("Refused") and not calls("click"), "destructive tap by text refused", r)
+        r = text(await c.call_tool("phone_tap", {"x": 190, "y": 490}))
+        check(r.startswith("Refused") and not calls("click"), "destructive tap by coordinates refused", r)
+        r = text(await c.call_tool("phone_tap", {"text": "Offload App"}))
+        check(r.startswith("Refused"), "offload also needs confirm", r)
+        r = text(await c.call_tool("phone_tap", {"text": "Delete App", "confirm": True}))
+        check("App deleted" in r and calls("click"), "confirm=True lets it through", r)
+
+        r = text(await c.call_tool("phone_tap", {"text": "Nonexistent"}))
+        check("no text matching" in r, "missing text explained with current screen", r)
+
+        r = await c.call_tool("phone_screenshot", {})
+        kinds = [getattr(x, "type", "") for x in r.content]
+        check(kinds[:2] == ["image", "text"], "screenshot returns image + text", kinds)
+        shot = calls("shot")[-1]
+        check(shot[shot.index("--width") + 1] == "390" and "--content" in shot, "screenshot is phone screen, 1px = 1pt", shot)
+
+        reset_log()
+        await c.call_tool("phone_scroll", {"direction": "down", "amount": 0.5})
+        d = calls("drag")[0]
+        check(float(d[4]) < float(d[2]), "scroll down = finger moves up", d)
+        reset_log()
+        await c.call_tool("phone_swipe", {"direction": "left"})
+        d = calls("drag")[0]
+        check(float(d[3]) < float(d[1]) and d[2] == d[4], "swipe left = finger moves left", d)
+        reset_log()
+        await c.call_tool("phone_go", {"where": "back"})
+        d = calls("drag")[0]
+        check(abs(float(d[1]) - (ORIGIN[0] + 1 * SCALE)) < 1, "back gesture starts at left edge", d)
+        reset_log()
+        r = text(await c.call_tool("phone_go", {"where": "home"}))
+        check(["menu", "Home Screen"] in calls("menu") and "Photos" in r, "home via View menu", r)
+
+        reset_log()
+        r = text(await c.call_tool("phone_type", {"text": "hello", "submit": True}))
+        check(calls("type")[0][1] == "hello" and calls("key")[0][1] == "return", "type + submit", calls("key"))
+
+        r = text(await c.call_tool("phone_find", {"text": "Photos"}))
+        check("Found 1 match" in r and "(145,137)" in r, "find returns tap point", r)
+        r = text(await c.call_tool("phone_wait", {"for_text": "Photos", "timeout": 2}))
+        check("appeared" in r, "wait_for text", r)
+
+        r = await c.call_tool("phone_zoom", {"x": 0, "y": 0, "width": 195, "height": 100})
+        crop = calls("shot")[-1]
+        check(crop[crop.index("--crop") + 1] == "0.00000,0.00000,0.50000,0.11848", "zoom crop normalized", crop)
+
+        print("prompts")
+        set_state(screen="perm")
+        r = text(await c.call_tool("phone_read_screen", {}))
+        check("PROMPT on screen" in r and "Allow Once" in r, "read_screen flags the prompt", r)
+        r = text(await c.call_tool("phone_alert", {}))
+        check(r.startswith("PROMPT on screen") and "Don\u2019t Allow" in r, "alert with no button describes it", r)
+        reset_log()
+        r = text(await c.call_tool("phone_alert", {"button": "allow once"}))
+        check(r.startswith("Refused") and "grants access" in r and not calls("click"), "granting access refused", r)
+        r = text(await c.call_tool("phone_tap", {"text": "Allow While Using App"}))
+        check(r.startswith("Refused") and not calls("click"), "tap on a grant answer is refused too", r)
+        r = text(await c.call_tool("phone_alert", {"button": "dismiss"}))
+        check("with 'Don\u2019t Allow'" in r and "Search Maps" in r, "dismiss picks the safe answer", r)
+        set_state(screen="perm")
+        r = text(await c.call_tool("phone_alert", {"button": "Allow Once", "confirm": True}))
+        check("with 'Allow Once'" in r and "Search Maps" in r, "confirm=True grants", r)
+
+        set_state(screen="confirm_delete")
+        reset_log()
+        r = text(await c.call_tool("phone_alert", {"button": "OK"}))
+        check(r.startswith("Refused") and "confirms" in r and not calls("click"), "OK to 'Delete ...?' refused", r)
+        r = text(await c.call_tool("phone_alert", {"button": "Nope"}))
+        check("no button 'Nope'" in r and "Cancel" in r, "unknown answer lists the real buttons", r)
+        r = text(await c.call_tool("phone_tap", {"text": "Cancel"}))
+        check("Tapped 'Cancel'" in r and "Offload App" in r, "cancel goes through", r)
+        set_state(screen="general")
+        r = text(await c.call_tool("phone_alert", {"button": "OK"}))
+        check("no alert" in r, "no prompt explained", r)
+
+        print("links")
+        r = text(await c.call_tool("phone_open_url", {"url": "spotify:search:jazz"}))
+        check("Opened spotify:search:jazz in Safari" in r and "PROMPT on screen" in r and "Open in" in r,
+              "deep link through Safari raises the open-in-app prompt", r)
+        check(["key", "l", "--mods", "cmd"] in calls("key"), "address bar focused with cmd+L", calls("key"))
+        r = text(await c.call_tool("phone_alert", {"button": "Open"}))
+        check("Jazz" in r, "open-in-app prompt answered", r)
+        r = text(await c.call_tool("phone_open_url", {"url": "example.com"}))
+        check("Opened https://example.com" in r and "Example Domain" in r, "bare domains get https://", r)
+
+        print("batches")
+        reset_log()
+        r = text(await c.call_tool("phone_do", {"steps": [
+            {"open_app": "Settings"}, {"tap": "General"}, {"tap": "iPhone Storage"},
+            {"wait_for": "Delete App", "timeout": 2}]}))
+        check("1. Opened 'Settings'" in r and "3. Tapped 'iPhone Storage'" in r and "4. 'Delete App' appeared" in r
+              and "Offload App" in r, "batch runs every step and returns the final screen", r)
+        check(len(calls("frontmost")) == 1 and len(calls("restore")) == 1, "batch hands focus back once",
+              (calls("frontmost"), calls("restore")))
+        reset_log()
+        r = text(await c.call_tool("phone_do", {"steps": [{"tap": "Delete App"}, {"go": "home"}]}))
+        check("1. tap stopped: Refused" in r and "not run" in r and not calls("click") and not calls("menu"),
+              "batch stops at a refused step", r)
+        check(len(calls("restore")) == 1, "focus handed back after a stopped batch", calls("restore"))
+        r = text(await c.call_tool("phone_do", {"steps": [{"tap": "Delete App", "confirm": True}]}))
+        check("1. Tapped 'Delete App'" in r and "App deleted" in r, "confirm per step", r)
+        r = text(await c.call_tool("phone_do", {"steps": [{"fly": "away"}]}))
+        check("needs exactly one of" in r, "unknown step explained", r)
+        r = text(await c.call_tool("phone_do", {"steps": [{"tap": [195, 400], "bogus": 1}]}))
+        check("bad option" in r, "bad step option explained", r)
+
+        set_state(screen="passcode")
+        r = text(await c.call_tool("phone_read_screen", {}))
+        check("Only the user may enter it" in r, "passcode screen flagged through tool", r)
+
+        set_state(locked=True)
+        r = text(await c.call_tool("phone_tap", {"x": 10, "y": 10}))
+        check("Touch ID" in r and "never type the password" in r, "locked mirroring explained", r)
+        r = text(await c.call_tool("phone_connect", {"wait_seconds": 1}))
+        check(r.startswith("Not ready") and "Touch ID" in r, "connect reports lock", r)
+        set_state(locked=False, screen_access=False)
+        r = text(await c.call_tool("phone_read_screen", {}))
+        check("Screen Recording" in r, "missing screen permission explained", r)
+        set_state(screen_access=True, running=False)
+        r = text(await c.call_tool("phone_connect", {"wait_seconds": 2}))
+        check(r.startswith("Connected") and calls("launch"), "connect launches mirroring", r)
+
+
+def main() -> int:
+    unit_tests()
+    asyncio.run(tool_tests())
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
