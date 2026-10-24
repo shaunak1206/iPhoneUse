@@ -6,10 +6,44 @@ app facts. Nothing is installed on the phone.
 
 ```
 Claude ──MCP──▶ iphone_mcp (Python)
-                 ├─ mirrorctl serve (Swift) ─▶ iPhone Mirroring window
+                 ├─ WebDriverAgent ─HTTP :8100 (Wi-Fi)─▶ runner app on the phone (phone unlocked, in hand)
+                 │     accessibility tree · taps/gestures · launch by bundle id · alerts · URLs
+                 ├─ mirrorctl serve (Swift) ─▶ iPhone Mirroring window (phone locked, nearby)
                  │     ScreenCaptureKit capture · Vision OCR · CGEvent mouse/keys · AX menus
                  └─ pymobiledevice3 ─USB/Wi-Fi lockdown─▶ storage, apps, battery, model
 ```
+
+## Two engines
+
+The tools are the same either way; `phone_status` says which one is driving.
+
+| | WebDriverAgent (preferred) | iPhone Mirroring (fallback) |
+|---|---|---|
+| Phone state | unlocked, can be in your hand | locked, near the Mac |
+| Reads the screen from | the accessibility tree (exact names, icon-only buttons, switch states) | OCR of the mirrored window |
+| Opens apps | by bundle id (instant), Spotlight for unknown names | Spotlight |
+| System alerts | WebDriverAgent's alert API | layout guess + tap |
+| Needs | Xcode, free Apple ID signing, Developer Mode, `scripts/wda_start.sh` running | nothing on the phone |
+
+WebDriverAgent ([appium/WebDriverAgent](https://github.com/appium/WebDriverAgent),
+pinned in `vendor/`) is a UI-test runner: it exists only while an `xcodebuild
+test-without-building` process on the Mac keeps it alive. `phone_connect`
+starts that in the background (`scripts/wda_start.sh`, log in `build/wda.log`,
+URL in `build/wda.url`). It outlives the MCP server, so later sessions reuse it.
+Free signing lasts 7 days; the start script re-signs when under 2 days remain.
+
+### WebDriverAgent setup (one time)
+
+```bash
+git clone --depth 1 --branch v16.15.3 https://github.com/appium/WebDriverAgent.git vendor/WebDriverAgent
+scripts/wda_start.sh --build   # signs with your Personal Team as com.shaunakkapur.WebDriverAgentRunner
+```
+
+Then plug the phone in once and call `phone_connect` (or run `scripts/wda_start.sh`).
+The first launch may ask you to trust the developer on the phone (Settings >
+General > VPN & Device Management). After the first cable start, the phone is
+reachable over the same Wi-Fi. `IPHONE_ENGINE=mirror|wda` forces an engine;
+`IPHONE_WDA_URL` points at a runner started some other way.
 
 ## Why this design
 

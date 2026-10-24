@@ -20,9 +20,23 @@ sys.path.insert(0, str(HERE.parent))
 
 from fastmcp import Client  # noqa: E402
 
+import iphone_mcp.wda  # noqa: E402
 from iphone_mcp import screen  # noqa: E402
 from iphone_mcp.bridge import Screen, TextItem  # noqa: E402
+
+iphone_mcp.wda.URL_FILE = TMP / "wda.url"  # never pick up a real runner's URL
+os.environ.pop("IPHONE_WDA_URL", None)
+from iphone_mcp import server  # noqa: E402
 from iphone_mcp.server import build  # noqa: E402
+
+from fake_wda import FakeWda  # noqa: E402
+
+
+def _no_runner(wait: float = 0) -> str:
+    raise server.BridgeError("iPhone not reachable (test)")
+
+
+server.wda.start = _no_runner  # never launch the real WebDriverAgent from the tests
 
 # phone screen origin in global points, and points per phone point
 ORIGIN = (697.0 + 8, 164.0 + 38)
@@ -268,9 +282,98 @@ async def tool_tests() -> None:
         check(r.startswith("Connected") and calls("launch"), "connect launches mirroring", r)
 
 
+async def wda_tests() -> None:
+    print("webdriveragent engine")
+    fake = FakeWda()
+    server.wda._url = fake.url
+    server.wda._ok_until = 0
+    set_state(screen="home", locked=False, running=True, screen_access=True)
+    try:
+        async with Client(build()) as c:
+            r = text(await c.call_tool("phone_status", {}))
+            check(f"WebDriverAgent: up at {fake.url}" in r and "Ready: yes, through WebDriverAgent" in r
+                  and "390 x 844 pt" in r, "status reports WebDriverAgent ready", r)
+            r = text(await c.call_tool("phone_connect", {}))
+            check(r.startswith("Connected through WebDriverAgent") and "[app] Settings" in r,
+                  "connect uses the running agent; icons tagged", r)
+
+            r = text(await c.call_tool("phone_open_app", {"name": "Settings"}))
+            check(fake.called("/wda/apps/launch") == [{"bundleId": "com.apple.Preferences"}]
+                  and "com.apple.Preferences" in r, "Apple app opened by bundle id", r)
+            check("[switch] Airplane Mode [off]" in r and "General" in r and "Hidden row" not in r
+                  and "(20,635)" not in r, "tree readout: switch state, offscreen rows and keyboard hidden", r)
+            r = text(await c.call_tool("phone_tap", {"text": "General"}))
+            check(fake.called("/wda/tap")[-1] == {"x": 100.0, "y": 251.0} and "iPhone Storage" in r,
+                  "tap by text taps the element center", (fake.called("/wda/tap"), r))
+            await c.call_tool("phone_tap", {"text": "iPhone Storage"})
+            r = text(await c.call_tool("phone_tap", {"text": "Delete App"}))
+            check(r.startswith("Refused") and len(fake.called("/wda/tap")) == 2, "risky tap refused under WDA", r)
+            r = text(await c.call_tool("phone_tap", {"text": "Delete App", "confirm": True}))
+            check("PROMPT on screen" in r and "Delete \u201cInstagram\u201d?" in r and "data." in r,
+                  "in-app alert read from the tree", r)
+            r = text(await c.call_tool("phone_alert", {"button": "Delete"}))
+            check(r.startswith("Refused"), "deleting through the alert needs confirm", r)
+            r = text(await c.call_tool("phone_alert", {"button": "dismiss"}))
+            check("with 'Cancel'" in r and "Offload App" in r, "dismiss taps Cancel on the alert", r)
+
+            fake.screen = "maps"
+            fake.sysalert = {"text": "Allow \u201cMaps\u201d to use your location?\nShows places near you.",
+                             "buttons": ["Allow Once", "Allow While Using App", "Don\u2019t Allow"], "then": "maps"}
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("PROMPT on screen" in r and "Allow While Using App" in r and "[search field] Search Maps" in r,
+                  "system permission prompt read through the alert API", r)
+            r = text(await c.call_tool("phone_alert", {"button": "Allow Once"}))
+            check(r.startswith("Refused") and not fake.called("/alert/accept"), "grant refused without confirm", r)
+            r = text(await c.call_tool("phone_alert", {"button": "dismiss"}))
+            check(fake.called("/alert/accept") == [{"name": "Don\u2019t Allow"}] and fake.sysalert is None,
+                  "system alert answered by name", (fake.called("/alert/accept"), r))
+
+            r = text(await c.call_tool("phone_open_url", {"url": "example.com"}))
+            check(fake.called("/url") == [{"url": "https://example.com"}] and "Example Domain" in r,
+                  "URL opened directly by the agent", r)
+            r = text(await c.call_tool("phone_type", {"text": "hi", "submit": True}))
+            check(fake.typed == "hi\n", "typing goes through /wda/keys", fake.typed)
+            r = text(await c.call_tool("phone_key", {"key": "a", "modifiers": "cmd"}))
+            check("need iPhone Mirroring" in r, "modifier keys explained", r)
+            await c.call_tool("phone_scroll", {"direction": "down", "amount": 0.5})
+            moves = [a for a in fake.called("/actions")[-1]["actions"][0]["actions"] if a["type"] == "pointerMove"]
+            check(moves[1]["y"] < moves[0]["y"], "scroll down = finger moves up (W3C touch actions)", moves)
+            r = text(await c.call_tool("phone_go", {"where": "home"}))
+            check(fake.called("/wda/homescreen") and "[app] Photos" in r, "home button", r)
+
+            fake.screen = "login"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("Password [password field]" in r and "Only the user may enter it" in r, "password field flagged", r)
+            fake.screen = "game"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("SCORE 120" in r, "empty tree falls back to OCR of the screenshot", r)
+            r = await c.call_tool("phone_screenshot", {"include_text": False})
+            check([getattr(x, "type", "") for x in r.content] == ["image"], "screenshot from the agent", r.content)
+
+            fake.screen, fake.session = "springboard", "S2"  # the runner restarted: old session is gone
+            r = text(await c.call_tool("phone_do", {"steps": [{"open_app": "Settings"}, {"tap": "General"}]}))
+            check("2. Tapped 'General'" in r and "iPhone Storage" in r, "batch under WDA; session re-created", r)
+
+            r = text(await c.call_tool("phone_open_app", {"name": "Some Game"}))
+            check(fake.typed.endswith("Some Game\n"), "unknown app goes through Spotlight", (fake.typed, r))
+
+            fake.locked = True
+            server.wda._ok_until = 0
+            r = text(await c.call_tool("phone_status", {}))
+            check("phone LOCKED" in r and "Ready: yes, through iPhone Mirroring" in r,
+                  "locked phone falls back to Mirroring", r)
+            r = text(await c.call_tool("phone_connect", {"engine": "wda"}))
+            check("phone is locked" in r and "Face ID" in r, "connect(engine=wda) explains the lock", r)
+    finally:
+        fake.stop()
+        server.wda._url = None
+        server.wda._ok_until = 0
+
+
 def main() -> int:
     unit_tests()
     asyncio.run(tool_tests())
+    asyncio.run(wda_tests())
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")
     return 1 if failures else 0
 

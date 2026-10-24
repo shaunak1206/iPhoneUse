@@ -142,6 +142,9 @@ def handle(args):
         out({"ok": True, "hit": t})
     if cmd in ("drag", "scroll", "activate", "restore", "warp", "button"):
         out({"ok": True})
+    if cmd == "ocr":
+        out({"width": 1170, "height": 2532,
+             "ocr": [{"text": "SCORE 120", "conf": 0.9, "x": 0.3, "y": 0.1, "w": 0.4, "h": 0.03}]})
     if cmd == "frontmost":
         out({"pid": 4242, "bundle": "com.example.editor"})
     if cmd == "cursor":

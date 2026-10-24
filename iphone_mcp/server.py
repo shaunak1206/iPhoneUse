@@ -1,8 +1,10 @@
 """iphone-mcp: computer use for a real iPhone, from the Mac.
 
-Screen control rides on macOS iPhone Mirroring (no app on the phone, no
-Xcode, no developer account). Storage and app facts come from the phone's
-lockdown services over USB/Wi-Fi when it is paired.
+Two engines drive the screen. WebDriverAgent (Apple's UI testing framework,
+running on the phone) is used when it is up and the phone is unlocked: the
+phone can be in the user's hand and screens come from the accessibility tree.
+Otherwise macOS iPhone Mirroring (phone locked and nearby, read by OCR).
+Storage and app facts come from the phone's lockdown services over USB/Wi-Fi.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import asyncio
 import functools
 import inspect
+import os
 import re
 import sys
 import time
@@ -22,9 +25,12 @@ from fastmcp.utilities.types import Image
 
 from . import device, screen
 from .bridge import BridgeError, Mirror, Screen, log
+from .wda import Wda, WdaError
 
 INSTRUCTIONS = """\
-Controls the user's real iPhone through macOS iPhone Mirroring.
+Controls the user's real iPhone, through WebDriverAgent on the phone (phone
+unlocked, can be in the user's hand) or macOS iPhone Mirroring (phone locked
+and near the Mac). phone_connect picks; phone_status says which is in use.
 
 Coordinates are phone points: origin top-left of the phone screen, x to the
 right, y down (an iPhone 13 is 390 x 844). Every text item in a screen
@@ -42,8 +48,10 @@ readout as "PROMPT on screen". Answer them with phone_alert(button=...);
 phone_alert(button="dismiss") backs out with the safe choice.
 
 Rules:
-- Mirroring only works while the phone is locked and nearby. If the user is
-  holding their phone, the tools say so: wait, don't fight it.
+- Mirroring only works while the phone is locked and nearby; WebDriverAgent
+  only while it is unlocked. If neither can reach the phone, the tools say why:
+  wait, don't fight it. The user may be using the phone at the same time under
+  WebDriverAgent, so keep each step short and re-read the screen.
 - Never type passcodes or passwords. If a screen asks for one, the user does it.
 - Before tapping anything that deletes, buys, sends, posts or signs out, or
   answering a prompt in a way that grants an app access, accepts terms, or says
@@ -54,7 +62,22 @@ Rules:
 """
 
 mirror = Mirror()
+wda = Wda()
+ENGINE = os.environ.get("IPHONE_ENGINE", "auto")  # auto | wda | mirror
 _lock = asyncio.Lock()
+
+
+def eng() -> Mirror | Wda:
+    """WebDriverAgent when it is up and the phone is unlocked, else iPhone Mirroring."""
+    if ENGINE == "mirror":
+        return mirror
+    if ENGINE == "wda" or wda.ready():
+        return wda
+    return mirror
+
+
+def _engine_name(e: Mirror | Wda) -> str:
+    return "WebDriverAgent" if isinstance(e, Wda) else "iPhone Mirroring"
 
 
 class Refused(Exception):
@@ -73,6 +96,8 @@ def tool_errors(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
             return str(e)
         except BridgeError as e:
             return f"Phone not controllable: {e}"
+        except WdaError as e:
+            return f"The phone refused that action: {e}"
         except device.DeviceUnavailable as e:
             return f"Device layer unavailable: {e}"
         except ValueError as e:
@@ -95,12 +120,27 @@ async def _io(fn, *a, **kw):
 async def _read(image: bool = False, settle: float = 0.0) -> Screen:
     if settle:
         await asyncio.sleep(settle)
-    return await _io(mirror.capture, image=image, ocr=True)
+    return await _io(eng().capture, image=image, ocr=True)
 
 
 async def _after(action: str, settle: float = SETTLE) -> str:
     s = await _read(settle=settle)
     return f"{action}\n\n{screen.describe(s)}"
+
+
+_installed: dict[str, str] | None = None
+
+
+async def _installed_bundle(name: str) -> str | None:
+    """Bundle id of an installed app by its name (lockdown, when the phone is paired)."""
+    global _installed
+    if _installed is None:
+        try:
+            _installed = {a["name"].lower(): a["bundle_id"] for a in await device.apps("User", sizes=False)}
+        except Exception as e:  # not on USB / Wi-Fi sync: Spotlight will do
+            log("app list unavailable:", repr(e))
+            _installed = {}
+    return _installed.get(name.strip().lower())
 
 
 def _url(u: str) -> str:
@@ -129,7 +169,7 @@ async def _resolve_target(x: float | None, y: float | None, text: str | None, oc
         return it.cx, it.cy, [it], f"'{it.text}' at ({it.cx:.0f},{it.cy:.0f})", screen.prompt(s)
     if x is None or y is None:
         raise ValueError("give x and y, or text")
-    s = mirror.last or await _read()
+    s = eng().last or await _read()
     return x, y, screen.at(s, x, y), f"({x:.0f},{y:.0f})", screen.prompt(s)
 
 
@@ -151,21 +191,32 @@ def build() -> FastMCP:
     @mcp.tool
     @tool_errors
     async def phone_status() -> str:
-        """Report whether the iPhone can be controlled right now, and why not if it can't.
+        """Report whether the iPhone can be controlled right now, which engine is in
+        use, and why not if it can't.
 
-        Covers iPhone Mirroring (running, connected, locked, in use), macOS
-        permissions, and whether the phone is reachable for storage/app queries.
+        Covers WebDriverAgent (running on the phone, phone unlocked), iPhone
+        Mirroring (running, connected, locked, in use), macOS permissions, and
+        whether the phone is reachable for storage/app queries.
         """
+        w = await asyncio.to_thread(wda.status) if ENGINE != "mirror" else {"configured": False}
+        if not w.get("configured"):
+            wline = "not started (phone_connect starts it when the phone is plugged in or on Wi-Fi)"
+        elif not w.get("reachable"):
+            wline = f"not reachable at {w.get('url')}: {w.get('error')}"
+        else:
+            wline = (f"up at {w['url']}, iOS {w.get('ios')}, phone {'LOCKED' if w.get('locked') else 'unlocked'}, "
+                     f"front app {w.get('app')}")
         st = await _io(mirror.state)
         lines = [
+            f"WebDriverAgent: {wline}",
             f"iPhone Mirroring running: {st.running}",
             f"Phone connected (mirroring live): {st.connected}",
             f"Accessibility permission: {st.raw.get('ax_trusted')}",
             f"Screen Recording permission: {st.screen_access}",
         ]
-        if st.window:
-            w, h = mirror.phone_size(st.window)
-            lines.append(f"Phone screen: {w:.0f} x {h:.0f} pt")
+        if st.window or w.get("reachable"):
+            pw, ph = await _io(eng().phone_size)
+            lines.append(f"Phone screen: {pw:.0f} x {ph:.0f} pt")
         for m in st.messages:
             lines.append(f"Mirroring app says: {m}")
         try:
@@ -174,18 +225,42 @@ def build() -> FastMCP:
                                              or "no phone on USB/Wi-Fi sync (storage tools unavailable)"))
         except device.DeviceUnavailable as e:
             lines.append(f"Device layer: {e}")
-        p = st.problem()
-        lines.append(f"\nReady: {'no. ' + p if p else 'yes'}")
+        if w.get("reachable") and not w.get("locked"):
+            lines.append("\nReady: yes, through WebDriverAgent (the phone can stay in the user's hand)")
+        else:
+            p = st.problem()
+            lines.append(f"\nReady: {'no. ' + p if p else 'yes, through iPhone Mirroring'}")
         return "\n".join(lines)
 
     @mcp.tool
     @tool_errors
-    async def phone_connect(wait_seconds: int = 20) -> str:
-        """Launch iPhone Mirroring if needed and wait until the phone is live.
+    async def phone_connect(wait_seconds: int = 20, engine: Literal["auto", "wda", "mirror"] = "auto") -> str:
+        """Get the phone controllable and say how.
 
-        Presses the app's own 'Try Again' / 'Connect' buttons when shown. It cannot
-        get past Touch ID or a phone that is in the user's hand; it reports those.
+        auto: WebDriverAgent if it is up and the phone is unlocked; else start it
+        (needs the phone plugged in or on the same Wi-Fi, ~30 s); else iPhone
+        Mirroring (launches it, presses its 'Try Again' / 'Connect' buttons). It
+        cannot get past Face ID, Touch ID or a passcode; it reports those.
         """
+        notes: list[str] = []
+        if engine != "mirror" and ENGINE != "mirror":
+            if not await asyncio.to_thread(wda.ready):
+                st = await asyncio.to_thread(wda.status)
+                if st.get("reachable") and st.get("locked"):
+                    notes.append("WebDriverAgent is up but the phone is locked (unlock it with Face ID to use it).")
+                else:
+                    try:
+                        await asyncio.to_thread(wda.start, max(45, wait_seconds))
+                    except BridgeError as e:
+                        notes.append(f"WebDriverAgent: {e}")
+            if await asyncio.to_thread(wda.ready):
+                return ("Connected through WebDriverAgent (the phone can stay in your hand).\n\n"
+                        + screen.describe(await _read()))
+            if engine == "wda":
+                st = await asyncio.to_thread(wda.status)
+                if st.get("reachable") and st.get("locked"):
+                    return "Not ready: the phone is locked. Ask the user to unlock it (Face ID); never type the passcode."
+                return "Not ready: " + " ".join(notes)
         st = await _io(mirror.state)
         if not st.running:
             await _io(mirror.launch)
@@ -203,9 +278,10 @@ def build() -> FastMCP:
                 break
             await asyncio.sleep(1.0)
         p = st.problem()
+        extra = ("\n" + "\n".join(notes)) if notes else ""
         if p:
-            return f"Not ready: {p}" + (f"\n(pressed: {', '.join(pressed)})" if pressed else "")
-        return "Connected.\n\n" + screen.describe(await _read())
+            return f"Not ready: {p}" + (f"\n(pressed: {', '.join(pressed)})" if pressed else "") + extra
+        return "Connected through iPhone Mirroring." + extra + "\n\n" + screen.describe(await _read())
 
     # -- seeing ------------------------------------------------------------
 
@@ -215,7 +291,7 @@ def build() -> FastMCP:
         """Screenshot of the phone. The image is scaled so 1 image pixel = 1 phone point,
         so pixel coordinates in it are tap coordinates. Also lists recognized text
         with tap points unless include_text is false."""
-        s = await _io(mirror.capture, image=True, ocr=include_text)
+        s = await _io(eng().capture, image=True, ocr=include_text)
         out: list = [_img(s)]
         if include_text:
             out.append(screen.describe(s))
@@ -234,7 +310,7 @@ def build() -> FastMCP:
         """High-resolution crop of a region (phone points), for small text or icons."""
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
-        return Image(data=await _io(mirror.zoom, x, y, width, height), format="jpeg")
+        return Image(data=await _io(eng().zoom, x, y, width, height), format="jpeg")
 
     @mcp.tool
     @tool_errors
@@ -255,7 +331,7 @@ def build() -> FastMCP:
             after = await _read(settle=0.6)
             if [it.text for it in after.items] == before:
                 return f"{text!r} not found; reached the end of the view.\n\n{screen.describe(after)}"
-        return f"{text!r} not found.\n\n{screen.describe(mirror.last or await _read())}"
+        return f"{text!r} not found.\n\n{screen.describe(eng().last or await _read())}"
 
     # -- acting ------------------------------------------------------------
     #
@@ -266,21 +342,21 @@ def build() -> FastMCP:
                    occurrence: int = 1, exact: bool = False, double: bool = False, confirm: bool = False) -> str:
         tx, ty, labels, where, p = await _resolve_target(x, y, text, occurrence, exact)
         _guard(labels, p, confirm)
-        await _io(mirror.tap, tx, ty, count=2 if double else 1)
+        await _io(eng().tap, tx, ty, count=2 if double else 1)
         return f"Tapped {where}."
 
     async def _long_press(x: float | None = None, y: float | None = None, text: str | None = None,
                           seconds: float = 1.0, occurrence: int = 1, confirm: bool = False) -> str:
         tx, ty, labels, where, p = await _resolve_target(x, y, text, occurrence, False)
         _guard(labels, p, confirm)
-        await _io(mirror.tap, tx, ty, hold_ms=max(0.3, seconds) * 1000)
+        await _io(eng().tap, tx, ty, hold_ms=max(0.3, seconds) * 1000)
         return f"Long-pressed {where} for {seconds:.1f}s."
 
     async def _swipe(direction: str | None = None, x: float | None = None, y: float | None = None,
                      to_x: float | None = None, to_y: float | None = None,
                      distance: float = 0.5, duration_ms: int = 300) -> str:
-        st = await _io(mirror.require)
-        w, h = mirror.phone_size(st.window)
+        await _io(eng().require)
+        w, h = await _io(eng().phone_size)
         sx = w / 2 if x is None else x
         sy = h / 2 if y is None else y
         if to_x is not None and to_y is not None:
@@ -291,7 +367,7 @@ def build() -> FastMCP:
             ex, ey = sx + dx, sy + dy
         else:
             raise ValueError("give direction, or to_x and to_y")
-        await _io(mirror.drag, sx, sy, ex, ey, ms=duration_ms)
+        await _io(eng().drag, sx, sy, ex, ey, ms=duration_ms)
         return f"Swiped ({sx:.0f},{sy:.0f}) → ({ex:.0f},{ey:.0f})."
 
     async def _scroll(direction: str = "down", amount: float = 0.5, x: float | None = None,
@@ -300,8 +376,8 @@ def build() -> FastMCP:
             raise ValueError("direction must be down, up, left or right")
         if not 0 < amount <= 0.9:
             raise ValueError("amount must be in (0, 0.9]")
-        st = await _io(mirror.require)
-        w, h = mirror.phone_size(st.window)
+        await _io(eng().require)
+        w, h = await _io(eng().phone_size)
         cx = w / 2 if x is None else x
         cy = h / 2 if y is None else y
         dist = amount * h
@@ -310,48 +386,61 @@ def build() -> FastMCP:
         sign = {"down": -1, "up": 1, "right": -1, "left": 1}[direction]
         if direction in ("down", "up"):
             y1 = cy - sign * dist / 2
-            await _io(mirror.drag, cx, y1, cx, y1 + sign * dist, ms=450, hold_ms=40)
+            await _io(eng().drag, cx, y1, cx, y1 + sign * dist, ms=450, hold_ms=40)
         else:
             x1 = cx - sign * amount * w / 2
-            await _io(mirror.drag, x1, cy, x1 + sign * amount * w, cy, ms=450, hold_ms=40)
+            await _io(eng().drag, x1, cy, x1 + sign * amount * w, cy, ms=450, hold_ms=40)
         return f"Scrolled {direction} {amount:.2f} screen."
 
     async def _type(text: str, submit: bool = False) -> str:
-        fallback = await _io(mirror.type_text, text)
+        fallback = await _io(eng().type_text, text)
         if submit:
-            await _io(mirror.key, "return")
+            await _io(eng().key, "return")
         note = f" (sent as unicode, verify: {''.join(fallback)!r})" if fallback else ""
         return f"Typed {len(text)} characters{note}{' and pressed Return' if submit else ''}."
 
     async def _key(key: str, modifiers: str = "") -> str:
-        await _io(mirror.key, key, modifiers)
+        await _io(eng().key, key, modifiers)
         return f"Pressed {modifiers + '+' if modifiers else ''}{key}."
 
     async def _go(where: str) -> str:
         if where == "back":
-            st = await _io(mirror.require)
-            w, h = mirror.phone_size(st.window)
-            await _io(mirror.drag, 1, h * 0.45, w * 0.75, h * 0.45, ms=280)
+            await _io(eng().require)
+            w, h = await _io(eng().phone_size)
+            await _io(eng().drag, 1, h * 0.45, w * 0.75, h * 0.45, ms=280)
         else:
             titles = {"home": "Home Screen", "app_switcher": "App Switcher", "spotlight": "Spotlight"}
             if where not in titles:
                 raise ValueError("where must be home, app_switcher, spotlight or back")
-            await _io(mirror.require)
-            await _io(mirror.menu, titles[where])
+            await _io(eng().require)
+            await _io(eng().menu, titles[where])
         return f"Went {where}."
 
     async def _open_app(name: str) -> str:
-        await _io(mirror.require)
-        await _io(mirror.menu, "Home Screen")
-        await asyncio.sleep(0.6)
-        await _io(mirror.menu, "Spotlight")
-        await asyncio.sleep(0.9)
-        await _io(mirror.key, "a", "cmd")  # clear a previous query
-        await _io(mirror.key, "delete")
-        await _io(mirror.type_text, name)
+        e = eng()
+        await _io(e.require)
+        if isinstance(e, Wda):
+            bid = e.bundle_for(name) or await _installed_bundle(name)
+            if bid:
+                try:
+                    await _io(e.launch, bid)
+                    await asyncio.sleep(1.0)
+                    return f"Opened {name!r} (`{bid}`)."
+                except WdaError as err:
+                    log(f"launch {bid} failed, trying Spotlight:", err)
+            await _io(e.menu, "Spotlight")
+            await asyncio.sleep(0.9)
+        else:
+            await _io(e.menu, "Home Screen")
+            await asyncio.sleep(0.6)
+            await _io(e.menu, "Spotlight")
+            await asyncio.sleep(0.9)
+            await _io(e.key, "a", "cmd")  # clear a previous query
+            await _io(e.key, "delete")
+        await _io(e.type_text, name)
         await asyncio.sleep(1.2)
         results = await _read()
-        await _io(mirror.key, "return")
+        await _io(e.key, "return")
         s = await _read(settle=1.6)
         if any(it.text.lower().strip() == "search" for it in s.items) and screen.find(s, name):
             raise ValueError(f"Spotlight did not launch {name!r}; results were:\n\n{screen.describe(results)}\n\n"
@@ -360,13 +449,19 @@ def build() -> FastMCP:
 
     async def _open_url(url: str) -> str:
         u = _url(url)
+        e = eng()
+        if isinstance(e, Wda):
+            await _io(e.require)
+            await _io(e.open_url, u)
+            await asyncio.sleep(1.5)
+            return f"Opened {u}."
         await _open_app("Safari")
         await asyncio.sleep(0.5)
-        await _io(mirror.key, "l", "cmd")  # Safari: focus the address bar
+        await _io(eng().key, "l", "cmd")  # Safari: focus the address bar
         await asyncio.sleep(0.5)
-        await _io(mirror.key, "a", "cmd")
-        await _io(mirror.type_text, u)
-        await _io(mirror.key, "return")
+        await _io(eng().key, "a", "cmd")
+        await _io(eng().type_text, u)
+        await _io(eng().key, "return")
         await asyncio.sleep(1.5)
         return f"Opened {u} in Safari (a link to an app may ask to open it: answer with phone_alert)."
 
@@ -384,7 +479,10 @@ def build() -> FastMCP:
             if not hit:
                 raise ValueError(f"no button {button!r} on the prompt.\n\n{p.describe()}")
         _guard([hit], p, confirm)
-        await _io(mirror.tap, hit.cx, hit.cy)
+        if hit.kind == "alert":  # a system alert read through WebDriverAgent's alert API
+            await _io(eng().answer_alert, hit.text)
+        else:
+            await _io(eng().tap, hit.cx, hit.cy)
         return f"Answered the prompt {('“' + p.title + '” ') if p.title else ''}with '{hit.text}'."
 
     async def _wait_for(text: str, timeout: float = 15) -> str:
@@ -509,7 +607,7 @@ def build() -> FastMCP:
             msg = await _wait_for(for_text, timeout)
         except ValueError as e:
             return str(e)
-        return f"{msg}\n\n{screen.describe(mirror.last or await _read())}"
+        return f"{msg}\n\n{screen.describe(eng().last or await _read())}"
 
     steps_doc = {
         "open_app": "name", "open_url": "url", "tap": "text, or [x, y]", "long_press": "text, or [x, y]",
@@ -535,7 +633,8 @@ def build() -> FastMCP:
         if not steps:
             raise ValueError("give at least one step")
         done: list[str] = []
-        await _io(mirror.hold_focus)
+        active = eng()
+        await _io(active.hold_focus)
         try:
             for i, step in enumerate(steps, 1):
                 acts = [k for k in step if k in steps_doc]
@@ -562,7 +661,7 @@ def build() -> FastMCP:
                 if act not in ("wait", "wait_for"):
                     await asyncio.sleep(SETTLE)
         finally:
-            await _io(mirror.release_focus)
+            await _io(active.release_focus)
         return "\n".join(done) + "\n\n" + screen.describe(await _read())
 
     # -- device layer (USB / Wi-Fi lockdown) --------------------------------

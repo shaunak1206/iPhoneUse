@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "bridge" / "mirrorctl.swift"
@@ -104,6 +105,8 @@ class TextItem:
     y: float
     w: float
     h: float
+    # element type when read from WebDriverAgent's tree (Button, Switch, ...); "" for OCR text
+    kind: str = ""
 
     @property
     def cx(self) -> float:
@@ -124,6 +127,8 @@ class Screen:
     items: list[TextItem] = field(default_factory=list)
     jpg: bytes | None = None
     taken_at: float = field(default_factory=time.time)
+    # an alert the engine read directly (WebDriverAgent); else screen.prompt guesses from layout
+    prompt: Any = None
 
 
 @dataclass

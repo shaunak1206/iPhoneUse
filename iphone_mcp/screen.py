@@ -64,17 +64,28 @@ def describe(screen: Screen, limit: int = 120) -> str:
            "as (x,y) tap point → text:"]
     n = 0
     for row in lines(screen):
-        cells = [f"({it.cx:.0f},{it.cy:.0f}) {it.text}" for it in row]
+        cells = [f"({it.cx:.0f},{it.cy:.0f}) {_tag(it)}{it.text}" for it in row]
         out.append("  " + "   |   ".join(cells))
         n += len(row)
         if n >= limit:
             out.append(f"  ... {len(screen.items) - n} more items")
             break
-    if any(SECRET_PROMPT.search(it.text) for it in screen.items):
+    if any(SECRET_PROMPT.search(it.text) or it.kind == "SecureTextField" for it in screen.items):
         out.append("NOTE: this screen asks for a passcode or password. Only the user may enter it.")
     if (p := prompt(screen)):
         out.append(p.describe())
     return "\n".join(out)
+
+
+# Element types worth naming in a readout; plain text and OCR stay untagged.
+TAGGED = {"Button": "button", "Link": "link", "Switch": "switch", "Toggle": "switch", "TextField": "field",
+          "SearchField": "search field", "TextView": "field", "SecureTextField": "field", "Icon": "app",
+          "Cell": "row", "Tab": "tab", "Slider": "slider", "Image": "image", "MenuItem": "menu item"}
+
+
+def _tag(it: TextItem) -> str:
+    t = TAGGED.get(it.kind)
+    return f"[{t}] " if t else ""
 
 
 def _norm(s: str) -> str:
@@ -111,6 +122,8 @@ def prompt(screen: Screen) -> Prompt | None:
     """Find a system-style prompt: known button labels stacked or side by side
     near the middle of the screen, with centered title text above them.
     Nav-bar buttons (top strip) and keyboard toolbar buttons (edges) don't count."""
+    if screen.prompt is not None:
+        return screen.prompt
     w, h = screen.width, screen.height
     cands = sorted((it for it in screen.items if clean(it.text) in BUTTONS
                     and 0.12 * h < it.cy < 0.97 * h and 0.1 * w < it.cx < 0.9 * w),
