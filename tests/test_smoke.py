@@ -16,6 +16,7 @@ TMP = Path(tempfile.mkdtemp(prefix="iphone-mcp-test-"))
 os.environ["IPHONE_MIRRORCTL"] = str(HERE / "fake_mirrorctl.py")
 os.environ["FAKE_STATE"] = str(TMP / "state.json")
 os.environ["FAKE_LOG"] = str(TMP / "calls.log")
+os.environ["IPHONE_JOURNAL"] = "0"  # never write to the real GitHub journal
 sys.path.insert(0, str(HERE.parent))
 
 from fastmcp import Client  # noqa: E402
@@ -25,8 +26,15 @@ from iphone_mcp import screen  # noqa: E402
 from iphone_mcp.bridge import Screen, TextItem  # noqa: E402
 
 iphone_mcp.wda.URL_FILE = TMP / "wda.url"  # never pick up a real runner's URL
+iphone_mcp.wda.LAST_FILE = TMP / "wda.last"  # nor keep a real one alive
+iphone_mcp.wda.RUNNER = "no-such-process-iphone-mcp-test"  # and never stop a real one
 os.environ.pop("IPHONE_WDA_URL", None)
+import iphone_mcp.dashboard  # noqa: E402
+import iphone_mcp.phone  # noqa: E402
 from iphone_mcp import server  # noqa: E402
+
+iphone_mcp.phone.ACTIVITY_FILE = TMP / "activity.jsonl"  # keep test actions out of the real activity log
+iphone_mcp.dashboard.ensure_running = lambda wait=10: "http://127.0.0.1:8780"  # no real dashboard process
 from iphone_mcp.server import build  # noqa: E402
 
 from fake_wda import FakeWda  # noqa: E402
@@ -36,7 +44,7 @@ def _no_runner(wait: float = 0) -> str:
     raise server.BridgeError("iPhone not reachable (test)")
 
 
-server.wda.start = _no_runner  # never launch the real WebDriverAgent from the tests
+server.phone.wda.start = _no_runner  # never launch the real WebDriverAgent from the tests
 
 # phone screen origin in global points, and points per phone point
 ORIGIN = (697.0 + 8, 164.0 + 38)
@@ -130,8 +138,9 @@ async def tool_tests() -> None:
         print(f"tools ({len(tools)})")
         expected = {"phone_status", "phone_connect", "phone_screenshot", "phone_read_screen", "phone_zoom",
                     "phone_find", "phone_tap", "phone_long_press", "phone_swipe", "phone_scroll", "phone_type",
-                    "phone_key", "phone_go", "phone_open_app", "phone_wait", "device_info", "device_storage",
-                    "device_apps", "phone_alert", "phone_open_url", "phone_do"}
+                    "phone_key", "phone_go", "phone_open_app", "phone_wait", "device_info", "device_apps",
+                    "phone_alert", "phone_open_url", "phone_do", "phone_disconnect", "phone_watch", "phone_goto",
+                    "phone_storage_report", "phone_journal", "phone_note"}
         check(expected <= tools, "all tools registered", expected - tools)
 
         set_state(screen="home")
@@ -180,6 +189,12 @@ async def tool_tests() -> None:
         await c.call_tool("phone_scroll", {"direction": "down", "amount": 0.5})
         d = calls("drag")[0]
         check(float(d[4]) < float(d[2]), "scroll down = finger moves up", d)
+        reset_log()
+        await c.call_tool("phone_scroll", {"direction": "up", "amount": 0.9})
+        ds = calls("drag")
+        ys = [float(v) for d in ds for v in (d[2], d[4])]
+        top_edge = ORIGIN[1] + 0.12 * 650 - 1
+        check(len(ds) == 2 and min(ys) >= top_edge, "long scroll split, never starts at the top edge", ds)
         reset_log()
         await c.call_tool("phone_swipe", {"direction": "left"})
         d = calls("drag")[0]
@@ -285,8 +300,8 @@ async def tool_tests() -> None:
 async def wda_tests() -> None:
     print("webdriveragent engine")
     fake = FakeWda()
-    server.wda._url = fake.url
-    server.wda._ok_until = 0
+    server.phone.wda._url = fake.url
+    server.phone.wda._ok_until = 0
     set_state(screen="home", locked=False, running=True, screen_access=True)
     try:
         async with Client(build()) as c:
@@ -302,6 +317,11 @@ async def wda_tests() -> None:
                   and "com.apple.Preferences" in r, "Apple app opened by bundle id", r)
             check("[switch] Airplane Mode [off]" in r and "General" in r and "Hidden row" not in r
                   and "(20,635)" not in r, "tree readout: switch state, offscreen rows and keyboard hidden", r)
+            check("(330,202) [switch] Airplane Mode [off]" in r and r.count("Airplane Mode") == 1,
+                  "switch row: one item, tap point on the toggle", r)
+            check("[button] Bluetooth, On" in r and "(100,241) Bluetooth" not in r and "(325,242) On" not in r,
+                  "row button replaces its child labels", r)
+            check(r.count("General") == 1, "a label mostly below the screen edge is dropped", r)
             r = text(await c.call_tool("phone_tap", {"text": "General"}))
             check(fake.called("/wda/tap")[-1] == {"x": 100.0, "y": 251.0} and "iPhone Storage" in r,
                   "tap by text taps the element center", (fake.called("/wda/tap"), r))
@@ -338,6 +358,9 @@ async def wda_tests() -> None:
             await c.call_tool("phone_scroll", {"direction": "down", "amount": 0.5})
             moves = [a for a in fake.called("/actions")[-1]["actions"][0]["actions"] if a["type"] == "pointerMove"]
             check(moves[1]["y"] < moves[0]["y"], "scroll down = finger moves up (W3C touch actions)", moves)
+            pause = [a for a in fake.called("/actions")[-1]["actions"][0]["actions"] if a["type"] == "pause"][-1]
+            check(pause["duration"] >= 150 and moves[0]["y"] - moves[1]["y"] == 422 + 20,
+                  "scroll pauses before lifting (no fling) and covers touch slop", (moves, pause))
             r = text(await c.call_tool("phone_go", {"where": "home"}))
             check(fake.called("/wda/homescreen") and "[app] Photos" in r, "home button", r)
 
@@ -347,6 +370,8 @@ async def wda_tests() -> None:
             fake.screen = "game"
             r = text(await c.call_tool("phone_read_screen", {}))
             check("SCORE 120" in r, "empty tree falls back to OCR of the screenshot", r)
+            r = text(await c.call_tool("phone_watch", {"open_on_mac": False}))
+            check("iPhone Live is running at http://127.0.0.1:8780" in r, "phone_watch points at the dashboard", r)
             r = await c.call_tool("phone_screenshot", {"include_text": False})
             check([getattr(x, "type", "") for x in r.content] == ["image"], "screenshot from the agent", r.content)
 
@@ -357,21 +382,115 @@ async def wda_tests() -> None:
             r = text(await c.call_tool("phone_open_app", {"name": "Some Game"}))
             check(fake.typed.endswith("Some Game\n"), "unknown app goes through Spotlight", (fake.typed, r))
 
+            r = text(await c.call_tool("phone_goto", {"place": "storage"}))
+            check(fake.called("/url")[-1] == {"url": "App-prefs:General&path=STORAGE_MGMT"} and "Went to Settings" in r,
+                  "goto opens a Settings page by link in one call", r)
+            r = text(await c.call_tool("phone_goto", {"place": "nowhere"}))
+            check("unknown place" in r and "storage" in r, "unknown place lists the known ones", r)
+
+            print("dashboard")
+            import warnings
+            warnings.filterwarnings("ignore", message=".*httpx.*starlette.testclient.*")
+            from starlette.testclient import TestClient
+            web = TestClient(iphone_mcp.dashboard.app(server.phone), base_url="http://127.0.0.1:8780")
+            r1 = web.get("/")
+            check(r1.status_code == 200 and "iPhone Live" in r1.text and "iphone-agent-journal" in r1.text,
+                  "dashboard page served", r1.status_code)
+            st = web.get("/api/status").json()
+            check(st.get("engine") == "wda" and st.get("ready") is True, "status API", st)
+            r2 = web.post("/api/do", json={"steps": [{"go": "home"}]})
+            check(r2.status_code == 403, "acting without the X-iPhone-Agent header is refused", r2.status_code)
+            r3 = web.post("/api/do", json={"steps": [{"go": "home"}]}, headers={"X-iPhone-Agent": "1"})
+            check(r3.status_code == 200 and "1. Went home." in r3.json()["result"], "do API acts with the header",
+                  r3.text[:200])
+            r4 = TestClient(iphone_mcp.dashboard.app(server.phone), base_url="http://evil.example").get("/api/status")
+            check(r4.status_code == 403, "foreign Host header refused (DNS rebinding)", r4.status_code)
+            r5 = web.post("/api/do", json={"steps": [{"tap": "Nope"}]}, headers={"X-iPhone-Agent": "1"})
+            check("stopped" in r5.json().get("result", ""), "failed step reported, not raised", r5.text[:200])
+            acts = web.get("/api/activity").json()
+            check(any(a["action"] == "Went home." for a in acts) and any(not a["ok"] for a in acts),
+                  "activity feed has actions and stops", acts[-3:])
+            r6 = web.get("/stream")
+            check(r6.status_code == 503, "stream says when the phone's stream is unreachable", r6.status_code)
+
             fake.locked = True
-            server.wda._ok_until = 0
+            server.phone.wda._ok_until = 0
             r = text(await c.call_tool("phone_status", {}))
             check("phone LOCKED" in r and "Ready: yes, through iPhone Mirroring" in r,
                   "locked phone falls back to Mirroring", r)
             r = text(await c.call_tool("phone_connect", {"engine": "wda"}))
             check("phone is locked" in r and "Face ID" in r, "connect(engine=wda) explains the lock", r)
+            iphone_mcp.wda.URL_FILE.write_text(fake.url)
+            r = text(await c.call_tool("phone_disconnect", {}))
+            check(r.startswith("Stopped WebDriverAgent") and fake.shut and not iphone_mcp.wda.URL_FILE.exists(),
+                  "disconnect ends the test session through /wda/shutdown", r)
     finally:
         fake.stop()
-        server.wda._url = None
-        server.wda._ok_until = 0
+        server.phone.wda._url = None
+        server.phone.wda._ok_until = 0
+
+
+def storage_and_journal_tests() -> None:
+    print("storage report")
+    from iphone_mcp import journal, storage
+    files = [["/DCIM/100APPLE/IMG_1.HEIC", 3_000_000, "2022-05-01"], ["/DCIM/100APPLE/IMG_1.MOV", 2_500_000, "2022-05-01"],
+             ["/DCIM/100APPLE/IMG_2.MOV", 900_000_000, "2023-01-01"], ["/DCIM/100APPLE/IMG_3.PNG", 400_000, "2026-01-01"],
+             ["/DCIM/101APPLE/IMG_9.MOV", 900_000_000, "2023-01-02"], ["/PhotoData/Photos.sqlite", 1_000_000_000, "2026-10-01"]]
+    m = storage.analyze_media(files)
+    cr = m["camera_roll"]
+    check(cr["live_motion"] == {"count": 1, "bytes": 2_500_000} and cr["videos"]["count"] == 2
+          and cr["screenshots"]["count"] == 1 and cr["same_size_copies_bytes"] == 900_000_000
+          and m["photos_caches"] == 1_000_000_000, "media analysis: live motion, videos, shots, copies", cr)
+    r = {"device": "Test", "ios": "26", "capacity": 128e9, "free": 2e9, "seconds": 1, "media": m, "apps": [
+        {"name": "Spotify", "bundle_id": "com.spotify.client", "app_bytes": 3e8, "data_bytes": 3.2e9, "total_bytes": 3.5e9},
+        {"name": "Brawl Stars", "bundle_id": "com.supercell.laser", "app_bytes": 1.9e9, "data_bytes": 1e8,
+         "total_bytes": 2e9}]}
+    r["suggestions"] = storage.suggestions(r)
+    text = storage.format_report(r)
+    check("2.00 GB free" in text and "Spotify > Settings > Storage" in text and "Offload App" in text
+          and "Live Photo motion" in text, "report text with app-specific tips", text)
+
+    print("journal")
+    puts: dict[str, str] = {}
+
+    def fake_gh(*args, body=None):
+        import base64
+        path = args[-1].split("/contents/", 1)[-1] if "/contents/" in args[-1] else args[-1]
+        if body is not None:
+            puts[path] = base64.b64decode(body["content"]).decode()
+            return {}
+        if path in puts:
+            return {"content": base64.b64encode(puts[path].encode()).decode(), "sha": "x"}
+        if args[-1].endswith(journal.REPO):
+            return {"visibility": "private"}
+        raise RuntimeError("404")
+
+    old_gh, old_act, old_off, old_on = journal._gh, journal.ACTIVITY, journal.OFFSET, os.environ.get("IPHONE_JOURNAL")
+    journal._gh, journal.ACTIVITY, journal.OFFSET = fake_gh, TMP / "j-activity.jsonl", TMP / "j.offset"
+    os.environ["IPHONE_JOURNAL"] = "1"
+    try:
+        journal.ACTIVITY.write_text(json.dumps({"t": 1761540000, "action": "Went home.", "ok": True}) + "\n"
+                                    + json.dumps({"t": 1761540005, "action": "tap stopped: no text", "ok": False}) + "\n")
+        path = journal.flush("session")
+        body = puts.get(path or "", "")
+        check(bool(path) and path.startswith("runs/") and "2 actions, 1 stopped" in body and "**stopped**" in body,
+              "flush uploads one run file per session", (path, body))
+        check(journal.flush("session") is None, "flush uploads nothing twice")
+        journal.note("first lesson")
+        journal.note("second lesson")
+        check(puts["NOTES.md"].index("first lesson") < puts["NOTES.md"].index("second lesson"),
+              "notes append, newest last", puts.get("NOTES.md"))
+        journal.save_report(r, text)
+        check("history.csv" in " ".join(puts) and "2.00,128.00" in puts["reports/storage/history.csv"],
+              "storage history row", puts.get("reports/storage/history.csv"))
+    finally:
+        journal._gh, journal.ACTIVITY, journal.OFFSET = old_gh, old_act, old_off
+        os.environ["IPHONE_JOURNAL"] = old_on or "0"
 
 
 def main() -> int:
     unit_tests()
+    storage_and_journal_tests()
     asyncio.run(tool_tests())
     asyncio.run(wda_tests())
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all passed'}")

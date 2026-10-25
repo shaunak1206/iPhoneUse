@@ -1,8 +1,18 @@
-# iphone-mcp
+# iPhoneMCP
 
-Computer use for a real iPhone, driven from the Mac. An MCP server that lets
-Claude see the phone screen, tap, swipe, type, open apps, and read storage and
-app facts. Nothing is installed on the phone.
+Computer use for a real iPhone, driven from a Mac. Claude (or any agent, script
+or app) can see the phone's screen, tap, type, open apps and Settings pages,
+answer prompts, and report where the storage went. Nothing extra on the phone
+beyond Apple's own UI-testing runner.
+
+One core, four ways in:
+
+| | For | How |
+|---|---|---|
+| **MCP server** | Claude Code and other agents | `phone_*` tools; `skills/iphone/SKILL.md` teaches the fast way to use them |
+| **`iphone` CLI** | your terminal and scripts | `iphone goto storage`, `iphone do '[...]'`, `iphone storage --deep` |
+| **iPhone Live** | watching and other apps | `iphone live` opens http://127.0.0.1:8780: the phone's screen live, Connect/Stop, every agent action, storage reports; the same URL serves an HTTP API |
+| **Run journal** | future sessions | each session's actions, storage reports over time and notes, in a private GitHub repo |
 
 ```
 Claude ──MCP──▶ iphone_mcp (Python)
@@ -86,19 +96,51 @@ item comes with its tap point, so most steps don't need an image at all.
 
 | Tool | What it does |
 |---|---|
-| `phone_status`, `phone_connect` | readiness and why not; launch/reconnect Mirroring |
-| `phone_read_screen` | text on screen with tap points (cheap) |
-| `phone_screenshot`, `phone_zoom` | image of the screen / a high-res region |
-| `phone_tap`, `phone_long_press` | by `x,y` or by visible `text` |
-| `phone_swipe`, `phone_scroll` | finger drags; scroll = controlled drag without fling |
-| `phone_type`, `phone_key` | hardware-keyboard typing into the focused field |
-| `phone_go` | `home`, `app_switcher`, `spotlight`, `back` (edge swipe) |
-| `phone_open_app` | any app by name, through Spotlight |
-| `phone_open_url` | a web page or app deep link, through Safari (cmd+L) |
-| `phone_alert` | read or answer the alert / permission prompt / confirmation sheet on screen; `button="dismiss"` takes the safe way out |
-| `phone_do` | several steps in one call (`[{"open_app": "Settings"}, {"tap": "General"}, ...]`), stops at the first failure or refusal |
-| `phone_find`, `phone_wait` | find text (optionally scrolling), wait for text |
-| `device_info`, `device_storage`, `device_apps` | model, iOS, battery, free space, apps ranked by size (USB/Wi-Fi) |
+| `phone_status`, `phone_connect`, `phone_disconnect` | readiness and why not; start an engine; stop WebDriverAgent (clears "Automation Running") |
+| `phone_watch` | open iPhone Live on the Mac |
+| `phone_do` | many steps in one call: `[{"goto": "storage"}, {"tap": "General"}, {"wait_for": "..."}]`; stops at the first failure or refusal |
+| `phone_goto` | jump to a Settings page by name (storage, battery, wifi, about, software update, ...) in one call |
+| `phone_open_app`, `phone_open_url` | apps by name or bundle id; web pages and app deep links |
+| `phone_tap`, `phone_long_press` | by visible `text` or `x,y` |
+| `phone_swipe`, `phone_scroll` | finger drags; scroll moves exactly the amount asked |
+| `phone_type`, `phone_key` | typing into the focused field |
+| `phone_go` | `home`, `app_switcher`, `spotlight`, `back` |
+| `phone_alert` | read or answer an alert / permission prompt / confirmation sheet; `button="dismiss"` is the safe way out |
+| `phone_read_screen`, `phone_screenshot`, `phone_zoom`, `phone_find`, `phone_wait` | seeing and waiting |
+| `phone_storage_report` | free space, every app (app vs. data), and with `deep=true` a camera roll scan; ends with ways to get space back. No screen needed |
+| `phone_journal`, `phone_note` | read earlier sessions' notes and runs; save a note for later |
+| `device_info`, `device_apps` | model, iOS, battery; installed apps |
+
+### HTTP API (iPhone Live, 127.0.0.1:8780)
+
+```
+GET  /api/status   /api/screen   /api/activity?since=<unix time>   /api/storage?deep=1   /stream (MJPEG)
+POST /api/connect  /api/disconnect  /api/do {"steps": [...]}  /api/goto {"place": "storage"}
+```
+
+POST endpoints need the header `X-iPhone-Agent: 1` (so web pages on other
+origins cannot drive the phone). Refusals come back as 409 with the reason.
+
+```bash
+curl -s -X POST localhost:8780/api/do -H 'X-iPhone-Agent: 1' -H 'Content-Type: application/json' \
+  -d '{"steps": [{"goto": "battery"}, {"wait_for": "Battery Health"}]}'
+```
+
+### Run journal
+
+`phone_disconnect` (and the idle auto-stop) uploads the session's actions to
+`runs/` in the private repo `shaunak1206/iphone-agent-journal`; every storage
+report goes to `reports/storage/` and a row in `history.csv`; `phone_note`
+appends to `NOTES.md`. Typed text is never logged. `IPHONE_JOURNAL=0` turns it
+off, `IPHONE_JOURNAL_REPO=owner/name` points it elsewhere.
+
+### Why not a hosted (Vercel) viewer
+
+The phone sits on a private network (campus Wi-Fi) and streams over plain HTTP.
+A page served from the cloud cannot reach it, and browsers block an HTTPS page
+from loading an HTTP stream from a private address. iPhone Live runs on the Mac
+next to the phone instead; exposing it remotely would need an authenticated
+tunnel, which is deliberately not set up.
 
 ### Safety rails
 

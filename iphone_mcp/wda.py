@@ -28,9 +28,11 @@ from .bridge import run as mirrorctl
 
 ROOT = Path(__file__).resolve().parent.parent
 URL_FILE = ROOT / "build" / "wda.url"
+LAST_FILE = ROOT / "build" / "wda.last"  # touched on every call; wda_start.sh stops the runner when it goes stale
 LOG_FILE = ROOT / "build" / "wda.log"
 START = ROOT / "scripts" / "wda_start.sh"
 SERVER_URL = re.compile(r"ServerURLHere->(http://[^<\s]+)<-ServerURLHere")
+RUNNER = "xcodebuild test-without-building.*WebDriverAgentRunner"  # the process keeping the runner alive
 
 # Apple apps by the name people use. Anything else goes through Spotlight.
 APPLE_APPS = {
@@ -85,13 +87,19 @@ class Wda:
         base = self.url
         if not base:
             raise BridgeError("WebDriverAgent is not running (phone_connect starts it)")
+        try:
+            LAST_FILE.touch()
+        except OSError:
+            pass
         for attempt in (1, 2):
             p = path
             if session:
                 p = f"/session/{self._session()}{path}"
             try:
+                # Actions wait for the app to go idle (up to 10 s, plus 2 s of animations) on WDA's side.
+                # Shortening those waits made each scroll take ~14 s instead of ~2.6 s, so allow for them here.
                 r = self._http.request(method, base.rstrip("/") + p, json=body, params=params,
-                                       timeout=timeout or 30)
+                                       timeout=timeout or 60)
             except httpx.HTTPError as e:
                 self._ok_until = 0
                 raise BridgeError(f"WebDriverAgent at {base} is unreachable ({type(e).__name__}). Is the phone on "
@@ -113,6 +121,12 @@ class Wda:
             self._sid = (out or {}).get("sessionId")
             if not self._sid:
                 raise BridgeError("WebDriverAgent did not open a session")
+            try:  # a smoother live view (default is 10 fps at full size, low quality)
+                self._req("POST", "/appium/settings", {"settings": {
+                    "mjpegServerFramerate": 15, "mjpegScalingFactor": 50, "mjpegServerScreenshotQuality": 50}},
+                    session=True)
+            except WdaError as e:
+                log("stream settings not applied:", e)
         return self._sid
 
     def status(self) -> dict:
@@ -164,6 +178,48 @@ class Wda:
             time.sleep(1)
         raise BridgeError(f"WebDriverAgent was still starting after {wait:.0f}s (log: {LOG_FILE})")
 
+    def stop(self) -> bool:
+        """Stop the runner and end its test session, which clears the phone's
+        "Automation Running" banner. True if something was running.
+
+        Killing xcodebuild is not enough: the phone's testmanagerd keeps the
+        session (and the banner) open. /wda/shutdown lets the test finish
+        normally; SIGINT (xcodebuild's own cancel) and SIGTERM are fallbacks."""
+        stopped = False
+        with self._lock:
+            if self.url:
+                try:
+                    self._http.get(self.url.rstrip("/") + "/wda/shutdown", timeout=5)
+                    stopped = True
+                except httpx.HTTPError:
+                    pass
+            # give the clean shutdown time to end xcodebuild, then escalate
+            for sig, wait in ((None, 10.0), ("-INT", 8.0), ("-TERM", 3.0)):
+                if sig:
+                    subprocess.run(["pkill", sig, "-f", RUNNER], capture_output=True)
+                    stopped = True
+                end = time.time() + wait
+                while time.time() < end and self._runner_alive():
+                    time.sleep(0.5)
+                if not self._runner_alive():
+                    break
+            URL_FILE.unlink(missing_ok=True)
+            self._sid, self._ok, self._ok_until = None, False, 0.0
+        return stopped
+
+    def _runner_alive(self) -> bool:
+        if self._proc and self._proc.poll() is None:
+            return True
+        return subprocess.run(["pgrep", "-f", RUNNER], capture_output=True).returncode == 0
+
+    @property
+    def stream_url(self) -> str | None:
+        """WebDriverAgent's live MJPEG view of the screen (port 9100 next to the API)."""
+        if not self.url:
+            return None
+        host = httpx.URL(self.url).host
+        return f"http://{host}:{os.environ.get('IPHONE_WDA_MJPEG_PORT', '9100')}"
+
     def require(self) -> None:
         if not self.ready():
             st = self.status()
@@ -203,8 +259,11 @@ class Wda:
         return buf.getvalue()
 
     def _tree(self) -> dict:
+        # WebDriverAgent's own visibility check costs ~5 s on a busy screen (0.3-1 s without);
+        # on-screen geometry in _items does the job.
         return self._req("GET", "/source", params={
-            "format": "json", "excluded_attributes": "frame,nativeFrame,traits,nativeAccessibilityElement"}) or {}
+            "format": "json", "excluded_attributes": "frame,nativeFrame,traits,nativeAccessibilityElement,"
+                                                     "visible,accessible,enabled,focused"}) or {}
 
     def _items(self, tree: dict) -> tuple[list[TextItem], scr.Prompt | None]:
         w, h = self.phone_size()
@@ -216,7 +275,10 @@ class Wda:
             x, y, rw, rh = (float(r.get(k) or 0) for k in ("x", "y", "width", "height"))
             if n.get("isVisible") in ("0", 0, False) or rw <= 1 or rh <= 1:
                 return None
-            if x >= w or y >= h or x + rw <= 0 or y + rh <= 0:
+            # mostly on screen: other home-screen pages, rows scrolled under a bar
+            vis_w = min(x + rw, w) - max(x, 0)
+            vis_h = min(y + rh, h) - max(y, 0)
+            if vis_w < 0.6 * rw or vis_h < 0.6 * rh:
                 return None
             label = (n.get("label") or "").strip()
             value = n.get("value")
@@ -253,6 +315,7 @@ class Wda:
             return shown + 1
 
         walk(tree, None)
+        items = _dedupe(items)
         items.sort(key=lambda t: (round(t.cy / 6), t.x))
         p = None
         if prompt and prompt[0][1]:
@@ -333,6 +396,14 @@ class Wda:
         self._done()
 
     def drag(self, x1: float, y1: float, x2: float, y2: float, *, ms: float = 300, hold_ms: float = 30) -> None:
+        if hold_ms >= 40:
+            # A scroll: iOS still flings after a 40 ms pause here (a 200 pt drag moved 308 pt) but not after
+            # 150 ms, and the first ~20 pt of a drag go to touch slop. Measured on an iPhone 14, iOS 26.4.
+            hold_ms = max(hold_ms, 150)
+            d = max(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5, 1)
+            x2, y2 = x2 + (x2 - x1) / d * 20, y2 + (y2 - y1) / d * 20
+        else:
+            hold_ms = 0  # a swipe: let it fling
         acts = [{"type": "pointerMove", "duration": 0, "x": round(x1), "y": round(y1)},
                 {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": 40},
                 {"type": "pointerMove", "duration": int(ms), "x": round(x2), "y": round(y2)}]
@@ -398,6 +469,37 @@ class Wda:
 
     def release_focus(self) -> None:
         pass
+
+
+def _inside(a: TextItem, b: TextItem, pad: float = 2) -> bool:
+    return (a.x >= b.x - pad and a.y >= b.y - pad and a.x + a.w <= b.x + b.w + pad
+            and a.y + a.h <= b.y + b.h + pad)
+
+
+def _bare(t: str) -> str:
+    return re.sub(r"\s*\[(on|off)\]$", "", t).strip().lower()
+
+
+def _dedupe(items: list[TextItem]) -> list[TextItem]:
+    """A Settings row is a button or switch whose label repeats its child texts
+    ("Bluetooth, On" over "Bluetooth" and "On"). Keep the row, drop the
+    children. A switch row's tap point moves onto its toggle, because tapping
+    the label does not flip it."""
+    rows = [i for i in items if i.kind in ("Button", "Switch", "Toggle", "Cell", "Link") and i.text]
+    keep: list[TextItem] = []
+    seen: set[tuple] = set()
+    for it in items:
+        key = (it.text, round(it.x), round(it.y), round(it.w), round(it.h))
+        if key in seen:
+            continue
+        seen.add(key)
+        parent = next((r for r in rows if r is not it and r.w * r.h > it.w * it.h and _inside(it, r)
+                       and _bare(it.text) in _bare(r.text)), None)
+        if parent is None:
+            keep.append(it)
+        elif it.kind in ("Switch", "Toggle") and parent.kind in ("Switch", "Toggle"):
+            parent.x, parent.y, parent.w, parent.h = it.x, it.y, it.w, it.h
+    return keep
 
 
 class WdaError(RuntimeError):

@@ -35,7 +35,12 @@ SCREENS = {
                        node("Icon", "Maps", (200, 110, 64, 80)),
                        node("Other", "", (0, 0, 390, 844), children=[node("Button", "Search", (160, 760, 70, 30))])),
     "settings": app(node("StaticText", "Settings", (20, 90, 150, 40)),
-                    node("Switch", "Airplane Mode", (16, 180, 358, 44), value="0"),
+                    node("Switch", "Airplane Mode", (16, 180, 358, 44), value="0", children=[
+                        node("StaticText", "Airplane Mode", (60, 191, 120, 22)),
+                        node("Switch", "", (305, 186, 51, 31), value="0")]),
+                    node("Button", "Bluetooth, On", (16, 2 * 140 - 50, 358, 44), children=[
+                        node("StaticText", "Bluetooth", (60, 241 - 10, 80, 22)), node("StaticText", "On", (310, 231, 30, 22))]),
+                    node("StaticText", "General", (60, 830, 80, 30)),
                     node("Cell", "", (16, 230, 358, 44), children=[node("StaticText", "General", (60, 240, 80, 22))]),
                     node("Cell", "Hidden row", (16, 2000, 358, 44)),
                     node("Keyboard", "", (0, 600, 390, 244), children=[node("Key", "q", (0, 610, 39, 50))])),
@@ -72,6 +77,7 @@ class FakeWda:
         self.sysalert: dict | None = None  # {"text": ..., "buttons": [...], "then": screen}
         self.calls: list[tuple[str, str, dict]] = []
         self.typed = ""
+        self.shut = False
         self._png = base64.b64encode(_png()).decode()
         fake = self
 
@@ -173,6 +179,11 @@ class FakeWda:
         if path == "/wda/keys":
             self.typed += "".join(body.get("value") or [])
             return 200, None
+        if path == "/appium/settings":
+            return 200, {}
+        if path == "/wda/shutdown":
+            self.shut = True
+            return 200, "Shutting down"
         if path in ("/actions", "/wda/keyboard/dismiss"):
             return 200, None
         return 404, {"error": "unknown command", "message": f"{method} {path}"}

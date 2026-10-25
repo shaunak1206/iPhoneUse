@@ -76,4 +76,28 @@ rm -f $LIST
 [[ -n $UDID ]] || { log "iPhone not reachable: plug it in (or join the same Wi-Fi after pairing it with Xcode once)"; exit 3 }
 
 log "starting WebDriverAgent on $UDID (stays up while this runs)"
-exec xcodebuild test-without-building -xctestrun $xctestrun[1] -destination "id=$UDID" -destination-timeout 20
+# keep the test result bundle here (replaced each run) instead of piling up in Xcode's DerivedData
+rm -rf $ROOT/build/wda-run.xcresult
+
+# Idle stop: the MCP server touches build/wda.last on every call. After IPHONE_WDA_IDLE seconds (default 120)
+# without one, end the test cleanly so the phone's "Automation Running" banner goes away by itself, even if
+# the session that started it is gone. $$ becomes xcodebuild's pid after the exec below.
+IDLE=${IPHONE_WDA_IDLE:-120}
+touch $ROOT/build/wda.last
+if (( IDLE > 0 )); then
+  (
+    while sleep 10; do
+      kill -0 $$ 2>/dev/null || exit 0
+      (( $(date +%s) - $(stat -f %m $ROOT/build/wda.last 2>/dev/null || print 0) < IDLE )) && continue
+      log "idle ${IDLE}s: stopping WebDriverAgent"
+      curl -s -m 5 "$(cat $ROOT/build/wda.url 2>/dev/null)/wda/shutdown" >/dev/null
+      $ROOT/.venv/bin/python -m iphone_mcp.journal flush session >/dev/null 2>&1  # this session's actions -> GitHub
+      sleep 10
+      kill -0 $$ 2>/dev/null && kill -INT $$
+      rm -f $ROOT/build/wda.url
+      exit 0
+    done
+  ) &!
+fi
+exec xcodebuild test-without-building -xctestrun $xctestrun[1] -destination "id=$UDID" -destination-timeout 20 \
+  -resultBundlePath $ROOT/build/wda-run.xcresult
