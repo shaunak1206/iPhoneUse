@@ -251,6 +251,8 @@ async def connections_submit(p: Phone, group: list[str]) -> str:
 async def main(argv: list[str]) -> str:
     p = Phone()
     cmd, args = argv[0], argv[1:]
+    if cmd not in ("help", "-h", "--help") and not await asyncio.to_thread(p.wda.ready):
+        print((await p.connect("wda", 60)).splitlines()[0], file=sys.stderr)  # the runner idled out: restart it
     if cmd == "open":
         return await open_in_chrome(p, URLS.get(args[0], args[0]), incognito="--normal" not in args)
     if cmd == "wordle":

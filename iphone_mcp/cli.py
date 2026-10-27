@@ -29,9 +29,16 @@ from .phone import SETTINGS, Phone, Refused
 from .wda import WdaError
 
 
+# Commands that act on the screen; they restart WebDriverAgent if it idled out.
+SCREEN = {"read", "shot", "tap", "type", "open", "url", "goto", "home", "back", "do", "dismiss", "keys", "marks",
+          "record"}
+
+
 async def run(a: argparse.Namespace) -> str:
     p = Phone()
     c = a.cmd
+    if c in SCREEN and p.engine != "mirror" and not await asyncio.to_thread(p.wda.ready):
+        print((await p.connect()).splitlines()[0], file=sys.stderr)
     if c == "status":
         return await p.status_text()
     if c == "connect":
