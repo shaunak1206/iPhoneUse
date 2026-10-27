@@ -3,6 +3,7 @@
 a recipe that turns a whole task into a few fast steps.
 
     python -m recipes.games open wordle            # fresh incognito tab in Chrome
+    python -m recipes.games wordle-run             # all of it in one call, with timings (~40-50 s)
     python -m recipes.games wordle-start           # Play, then clear the ad and How-to-play layers
     python -m recipes.games wordle-solve           # play to the end: most common word that fits
     python -m recipes.games wordle crane           # type a guess, print the colors
@@ -258,6 +259,19 @@ async def main(argv: list[str]) -> str:
     if cmd == "wordle":
         rows = await wordle_guess(p, args[0])
         return "\n".join(rows) + "\n\nfits: " + ", ".join(wordle_candidates(rows, 12))
+    if cmd == "wordle-run":
+        import time
+        t0 = time.time()
+        marks = []
+        await open_in_chrome(p, URLS["wordle"])
+        marks.append(("open", time.time() - t0))
+        await wordle_start(p)
+        marks.append(("start (Play, ad, How to play)", time.time() - t0 - sum(m[1] for m in marks)))
+        rows = await wordle_solve(p, args[0] if args else "crane")
+        marks.append((f"solve ({len(rows)} guesses)", time.time() - t0 - sum(m[1] for m in marks)))
+        times = "\n".join(f"  {label:32s} {sec:5.1f}s" for label, sec in marks)
+        return ("\n".join(rows) + ("\n\nsolved" if solved(rows) else "\n\nnot solved")
+                + f"\n\n{times}\n  {'total':32s} {time.time() - t0:5.1f}s")
     if cmd == "wordle-start":
         return await wordle_start(p)
     if cmd == "wordle-solve":

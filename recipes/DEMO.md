@@ -1,7 +1,8 @@
 # Demo: Wordle, Spelling Bee and Connections on the phone
 
-About 5 minutes end to end. Every line is one call; nothing waits on a fixed timer
-except the Wordle tile flips.
+About 3-5 minutes end to end. Every line is one call; nothing waits on a fixed timer
+except the Wordle tile flips. Before this pass, getting past Wordle's ad and
+How-to-play screen alone took about 4 minutes of single steps.
 
 ```bash
 cd ~/iPhoneMCP && source .venv/bin/activate
@@ -13,12 +14,19 @@ cd ~/iPhoneMCP && source .venv/bin/activate
    Every line should say `ok`. It leaves WebDriverAgent running.
 3. **Watch and record:** `iphone live` (the dashboard, live screen + action feed), then
    `iphone record start --name nyt-games`.
-4. **Wordle** (fresh incognito tab, so today's puzzle is unplayed):
+4. **Wordle** (fresh incognito tab, so today's puzzle is unplayed), one call with timings:
    ```bash
-   python -m recipes.games open wordle
-   python -m recipes.games wordle-start      # Play, ad, How-to-play: cleared
-   python -m recipes.games wordle-solve      # plays to the end (99/100 in simulation, ~3.7 guesses)
+   python -m recipes.games wordle-run        # open + start + solve
    ```
+   Expected, about **40-50 s** in all:
+
+   | phase | estimate | where the time goes |
+   |---|---|---|
+   | open in a new incognito Chrome tab | 8-12 s | ~4 taps, typing the address, page load |
+   | start | 10-12 s | mostly the ad's 5 s "Skip ad" countdown, then the How-to-play close |
+   | solve | 16-20 s | ~4 guesses (3.7 average in simulation) at 4-5 s: ~2 s to type a word in one request, ~2 s of tile flips |
+
+   The same in steps: `open wordle`, `wordle-start`, `wordle-solve`.
 5. **Spelling Bee** (spellbee.org, the free one):
    ```bash
    python -m recipes.games open bee
