@@ -57,7 +57,7 @@ def ensure_repo() -> None:
     subprocess.run(["gh", "repo", "create", REPO, "--private", "--description",
                     "Run journal for iPhoneMCP: sessions, storage reports, notes"], check=True,
                    capture_output=True, text=True, timeout=60)
-    put("README.md", "# iPhone agent journal\n\nWritten by [iPhoneMCP](https://github.com/shaunak1206/iPhoneMCP).\n\n"
+    put("README.md", "# iPhone agent journal\n\nWritten by [iPhoneMCP](https://github.com/shaunak1206/iPhoneUse).\n\n"
         "- `runs/`: one file per session, every phone action with its time\n"
         "- `reports/storage/`: storage reports and `history.csv` over time\n"
         "- `NOTES.md`: lessons and facts for future sessions\n", "Start the journal")

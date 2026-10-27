@@ -5,7 +5,7 @@ description: Use whenever the user wants something done on their real iPhone, or
 
 # iPhone
 
-The `iphone` MCP server (repo `~/iPhoneMCP`, GitHub `shaunak1206/iPhoneMCP`) drives
+The `iphone` MCP server (repo `~/iPhoneMCP`, GitHub `shaunak1206/iPhoneUse`) drives
 the user's real iPhone from the Mac. Same powers from a shell: the `iphone` CLI
 (`~/iPhoneMCP/.venv/bin/iphone`), and from other apps: the iPhone Live HTTP API on
 `http://127.0.0.1:8780` (see the repo README).
