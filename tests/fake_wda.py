@@ -261,6 +261,19 @@ class FakeWda:
         if path == "/wda/shutdown":
             self.shut = True
             return 200, "Shutting down"
-        if path in ("/actions", "/wda/keyboard/dismiss"):
+        if path == "/actions":
+            x = y = 0.0
+            for a in body["actions"][0]["actions"]:
+                if a["type"] == "pointerMove":
+                    x, y = a["x"], a["y"]
+                elif a["type"] == "pointerDown":
+                    down = (x, y)
+                elif a["type"] == "pointerUp" and (x, y) == down:  # a tap, not a drag
+                    t = self._hit(x, y)
+                    self.pressed.append(t or "")
+                    if (nxt := TAPS.get((self.screen, t))):
+                        self.screen = nxt
+            return 200, None
+        if path == "/wda/keyboard/dismiss":
             return 200, None
         return 404, {"error": "unknown command", "message": f"{method} {path}"}

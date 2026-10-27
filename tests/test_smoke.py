@@ -446,6 +446,10 @@ async def wda_tests() -> None:
                   "keys and taps steps in a batch", (fake.pressed, r[:200]))
             check(len(fake.called("/source")) - reads <= 3, "each batch of taps costs one screen read",
                   len(fake.called("/source")) - reads)
+            n_actions = len(fake.called("/actions"))
+            await c.call_tool("phone_keys", {"keys": "crane", "then": "enter"})
+            check(len(fake.called("/actions")) - n_actions == 1, "a whole word goes in one touch request",
+                  len(fake.called("/actions")) - n_actions)
             r = text(await c.call_tool("phone_keys", {"keys": "7"}))
             check("no on-screen key for '7'" in r, "missing key explained", r[:80])
 

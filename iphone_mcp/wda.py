@@ -513,6 +513,19 @@ class Wda:
             self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
         self._done()
 
+    def tap_many(self, points: list[tuple[float, float]], hold_ms: int = 40, gap_ms: int = 90) -> None:
+        """Several taps in one W3C actions request: one round trip for a whole word on
+        a page keyboard instead of ~0.6 s per tap."""
+        acts: list[dict] = []
+        for x, y in points:
+            acts += [{"type": "pointerMove", "duration": 0, "x": round(x), "y": round(y)},
+                     {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": hold_ms},
+                     {"type": "pointerUp", "button": 0}, {"type": "pause", "duration": gap_ms}]
+        self._req("POST", "/actions", {"actions": [{"type": "pointer", "id": "finger1",
+                                                    "parameters": {"pointerType": "touch"}, "actions": acts}]},
+                  session=True, timeout=60 + len(points))
+        self._done()
+
     def drag(self, x1: float, y1: float, x2: float, y2: float, *, ms: float = 300, hold_ms: float = 30) -> None:
         if hold_ms >= 40:
             # A scroll: iOS still flings after a 40 ms pause here (a 200 pt drag moved 308 pt) but not after

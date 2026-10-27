@@ -529,9 +529,17 @@ class Phone:
             return out
 
         points = await self._from_screen(resolve)
-        for x, y, _ in points:
-            await self.io(self.eng().tap, x, y)
+        await self._tap_points([(x, y) for x, y, _ in points])
         return self._did("Tapped " + ", ".join(f"'{lbl}'" for _, _, lbl in points) + ".")
+
+    async def _tap_points(self, points: list[tuple[float, float]]) -> None:
+        """Tap in order; under WebDriverAgent all in one request."""
+        e = self.eng()
+        if isinstance(e, Wda) and len(points) > 1:
+            await self.io(e.tap_many, points)
+        else:
+            for x, y in points:
+                await self.io(e.tap, x, y)
 
     async def _from_screen(self, resolve):
         """resolve(screen) on the cached read; if it fails there, once more on a new read
@@ -562,8 +570,7 @@ class Phone:
             return out
 
         points = await self._from_screen(resolve)
-        for x, y in points:
-            await self.io(self.eng().tap, x, y)
+        await self._tap_points(points)
         return self._did(f"Pressed {''.join(k if len(k) == 1 else f' [{k}] ' for k in seq).strip()} on the on-screen keys.")
 
     async def dismiss(self, rounds: int = 4, wait_ads: float = 12) -> str:

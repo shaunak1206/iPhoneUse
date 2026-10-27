@@ -3,10 +3,13 @@
 a recipe that turns a whole task into a few fast steps.
 
     python -m recipes.games open wordle            # fresh incognito tab in Chrome
+    python -m recipes.games wordle-start           # Play, then clear the ad and How-to-play layers
+    python -m recipes.games wordle-solve           # play to the end: most common word that fits
     python -m recipes.games wordle crane           # type a guess, print the colors
     python -m recipes.games wordle-hint            # words that fit every clue so far
     python -m recipes.games bee                    # read the hive, list words (pangrams first)
     python -m recipes.games bee-submit 40          # type the best 40 words
+    python -m recipes.games bee-run 40             # read the hive and submit, one call
     python -m recipes.games connections            # read the 16 words
     python -m recipes.games connections-submit "a,b,c,d"
 
@@ -91,8 +94,19 @@ def board(s) -> list[str]:
 
 async def wordle_guess(p: Phone, word: str) -> list[str]:
     await p.keys(["backspace"] * 5 + list(word.lower()) + ["enter"])
-    await asyncio.sleep(2.2)  # five tiles flip one after another
+    await asyncio.sleep(1.4)  # five tiles flip one after another
+    await p.settle_screen()
     return board(await p.read())
+
+
+async def wordle_start(p: Phone) -> str:
+    """From the Wordle start page: Play, then clear the ad and How-to-play layers."""
+    s = await p.read()
+    if screen.find(s, "Play", exact=True):
+        await p.tap(text="Play", exact=True)
+        await p.settle_screen()
+    await p.dismiss(rounds=4, wait_ads=15)
+    return await p.wait_for("enter", 15)
 
 
 def fits(word: str, rows: list[str]) -> bool:
@@ -118,7 +132,57 @@ def fits(word: str, rows: list[str]) -> bool:
 
 
 def wordle_candidates(rows: list[str], limit: int = 15) -> list[str]:
-    return [w for w in words() if len(w) == 5 and fits(w, rows)][:limit]
+    found = [w for w in words() if len(w) == 5 and fits(w, rows)]
+    if not found:  # a rarer answer: fall back to every dictionary word
+        d = Path("/usr/share/dict/words")
+        found = [w for w in (d.read_text().split() if d.exists() else []) if len(w) == 5 and w.islower()
+                 and fits(w, rows)]
+    return found[:limit]
+
+
+def best_guess(rows: list[str], cands: list[str]) -> str:
+    """The most common fitting word, unless several words differ in only a letter
+    or two (_ATCH, _OWER): then a probe word covering as many of the letters that
+    tell them apart as possible, so the answer is pinned down in one more guess."""
+    if len(cands) <= 2 or len(rows) >= 5:
+        return cands[0]
+    shared = set.intersection(*(set(w) for w in cands))
+    freq = Counter(ch for w in cands for ch in set(w) if ch not in shared)
+    pool = [w for w in words()[:25000] if len(w) == 5]
+
+    def score(w: str) -> float:
+        return sum(freq[ch] for ch in set(w)) + (0.5 if w in cands else 0)
+    probe = max(pool, key=score)
+    return probe if score(probe) > score(cands[0]) + 1 else cands[0]
+
+
+def solved(rows: list[str]) -> bool:
+    return bool(rows) and all(c.endswith("G") for c in rows[-1].split())
+
+
+async def wordle_solve(p: Phone, first: str = "crane", guess=None) -> list[str]:
+    """Play until solved: the most common word that fits every clue so far. A word
+    Wordle rejects (row did not fill) is skipped. `guess` is injectable for tests."""
+    guess = guess or (lambda w: wordle_guess(p, w))
+    rows = board(await p.read()) if p else []
+    tried: set[str] = set()
+    while len(rows) < 6 and not solved(rows):
+        cands = [w for w in wordle_candidates(rows, 300) if w not in tried]
+        if not rows:
+            word = first
+        elif not cands:
+            break
+        else:
+            word = best_guess(rows, cands)
+            if word in tried:
+                word = cands[0]
+        tried.add(word)
+        new = await guess(word)
+        if len(new) > len(rows):
+            rows = new
+            if p:
+                p.record(f"Wordle: {word.upper()} -> {rows[-1]}")
+    return rows
 
 
 # -- Spelling Bee (spellbee.org) ------------------------------------------
@@ -145,10 +209,22 @@ def bee_words(center: str, outer: list[str], limit: int = 60) -> list[str]:
 
 
 async def bee_submit(p: Phone, ws: list[str]) -> str:
+    """Read the hive once, then each word is one touch request (letters + Enter)."""
+    s = await p.read()
+    cells = {it.text.strip().lower(): (it.cx, it.cy) for it in s.items
+             if len(it.text.strip()) == 1 and it.text.strip().isalpha()}
+    enter = next(((it.cx, it.cy) for it in s.items if it.text.strip().lower() == "enter"), None)
+    if enter is None:
+        raise ValueError("no Enter button on screen\n\n" + screen.describe(s))
+    sent = 0
     for w in ws:
-        await p.keys(list(w) + ["Enter"])
-        await asyncio.sleep(0.35)  # the "Nice!" toast
-    return f"Submitted {len(ws)} words."
+        if not all(ch in cells for ch in w):
+            continue
+        await p._tap_points([cells[ch] for ch in w] + [enter])
+        await asyncio.sleep(0.25)  # the word clears / "Nice!" toast
+        sent += 1
+    p.record(f"Spelling Bee: submitted {sent} words")
+    return f"Submitted {sent} words: {', '.join(ws[:sent])}."
 
 
 # -- Connections ----------------------------------------------------------
@@ -180,6 +256,15 @@ async def main(argv: list[str]) -> str:
     if cmd == "wordle":
         rows = await wordle_guess(p, args[0])
         return "\n".join(rows) + "\n\nfits: " + ", ".join(wordle_candidates(rows, 12))
+    if cmd == "wordle-start":
+        return await wordle_start(p)
+    if cmd == "wordle-solve":
+        rows = await wordle_solve(p, args[0] if args else "crane")
+        return "\n".join(rows) + ("\n\nsolved" if solved(rows) else "\n\nnot solved")
+    if cmd == "bee-run":
+        center, outer = hive(await p.read())
+        ws = bee_words(center, outer, int(args[0]) if args else 40)
+        return f"center {center.upper()}, outer {' '.join(outer).upper()}\n" + await bee_submit(p, ws)
     if cmd == "wordle-hint":
         rows = board(await p.read())
         return "\n".join(rows) + "\n\nfits: " + ", ".join(wordle_candidates(rows, 25))
