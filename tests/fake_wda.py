@@ -9,6 +9,7 @@ import io
 import json
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -55,11 +56,45 @@ SCREENS = {
     "login": app(node("TextField", "Email", (20, 300, 350, 44)), node("SecureTextField", "Password", (20, 360, 350, 44))),
     "game": app(),
     "web": app(node("StaticText", "Example Domain", (120, 200, 150, 22))),
+    "ad": app(node("StaticText", "ADVERTISEMENT", (140, 110, 110, 18)),
+              node("StaticText", "Skip ad in 2 seconds", (230, 740, 140, 18))),
+    "ad_ready": app(node("StaticText", "ADVERTISEMENT", (140, 110, 110, 18)),
+                    node("Button", "Continue to Wordle", (220, 728, 150, 30))),
+    "cookies": app(node("StaticText", "We use cookies and similar technologies", (20, 600, 350, 40)),
+                   node("Button", "Accept", (20, 700, 160, 44)), node("Button", "Reject", (210, 700, 160, 44))),
+    "wordle": app(*[node("Button", lab, (8 + 38 * i, 580, 34, 50)) for i, lab in
+                    enumerate(["add q", "add w", "e absent", "r absent", "add t", "add y", "add u", "add i", "add o"])],
+                  *[node("Button", lab, (8 + 38 * i, 646, 34, 50)) for i, lab in
+                    enumerate(["a absent", "add s", "add d", "add f", "add g", "add h", "add j", "add k", "add l"])],
+                  *[node("Button", lab, (8 + 38 * i, 712, 34, 50)) for i, lab in
+                    enumerate(["enter", "add z", "add x", "c absent", "add v", "add b", "n present", "add m",
+                               "backspace"])]),
+    # Chrome: the tab grid is a full-screen layer under the page
+    "chrome": app(node("Other", "", (0, 0, 390, 844), children=[
+        node("ScrollView", "", (0, 0, 390, 844), children=[
+            node("Cell", "", (16, 115, 358, 60), children=[node("StaticText", "Inactive tabs", (32, 125, 97, 21))]),
+            node("StaticText", "Tabs not used for 21 days", (32, 150, 200, 18))]),
+        node("Other", "", (0, 0, 390, 844), children=[
+            node("StaticText", "Wordle", (150, 250, 90, 30)), node("StaticText", "Get 6 chances", (100, 300, 190, 20)),
+            node("Button", "Play", (150, 400, 90, 44))])])),
+    # the home screen: icons under an empty full-screen layer stay visible
+    "home2": app(node("Other", "", (0, 0, 390, 844), children=[
+        node("Other", "", (0, 0, 390, 844), children=[node("Icon", n, (20 + 90 * i, 110, 64, 80))
+                                                       for i, n in enumerate(["Weather", "Find My", "Home"])]),
+        node("Other", "", (0, 0, 390, 844))])),
 }
 TAPS = {("springboard", "Settings"): "settings", ("settings", "General"): "general",
         ("general", "iPhone Storage"): "storage", ("storage", "Delete App"): "confirm",
-        ("confirm", "Delete"): "deleted", ("confirm", "Cancel"): "storage"}
+        ("confirm", "Delete"): "deleted", ("confirm", "Cancel"): "storage",
+        ("ad_ready", "Continue to Wordle"): "wordle", ("cookies", "Reject"): "web", ("cookies", "Accept"): "web"}
 BUNDLES = {"com.apple.Preferences": "settings", "com.apple.Maps": "maps", "com.example.game": "game"}
+
+
+def _jpeg(shade: int) -> bytes:
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (195, 422), (shade, shade, shade)).save(buf, "JPEG", quality=70)
+    return buf.getvalue()
 
 
 def _png() -> bytes:
@@ -78,6 +113,8 @@ class FakeWda:
         self.calls: list[tuple[str, str, dict]] = []
         self.typed = ""
         self.shut = False
+        self.pressed: list[str] = []
+        self.ad_reads = 0
         self._png = base64.b64encode(_png()).decode()
         fake = self
 
@@ -111,8 +148,38 @@ class FakeWda:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
+        # MJPEG like WDA's :9100 — the picture changes for `moving` frames, then holds still
+        self.moving = 0
+        frames = [_jpeg(40), _jpeg(200)]
+
+        class M(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--BoundaryString")
+                self.end_headers()
+                i = 0
+                try:
+                    while True:
+                        f = frames[i % 2] if fake.moving > 0 else frames[0]
+                        fake.moving = max(0, fake.moving - 1)
+                        self.wfile.write(b"--BoundaryString\r\nContent-type: image/jpeg\r\nContent-Length: "
+                                         + str(len(f)).encode() + b"\r\n\r\n" + f + b"\r\n\r\n")
+                        self.wfile.flush()
+                        i += 1
+                        time.sleep(1 / 30)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        self.mjpeg = ThreadingHTTPServer(("127.0.0.1", 0), M)
+        self.mjpeg_port = self.mjpeg.server_address[1]
+        threading.Thread(target=self.mjpeg.serve_forever, daemon=True).start()
+
     def stop(self) -> None:
         self.server.shutdown()
+        self.mjpeg.shutdown()
 
     def called(self, path_re: str) -> list[dict]:
         return [b for _, p, b in self.calls if re.fullmatch(path_re, p)]
@@ -147,6 +214,10 @@ class FakeWda:
         if path == "/window/size":
             return 200, {"width": 390, "height": 844}
         if path == "/source":
+            if self.screen == "ad":
+                self.ad_reads += 1
+                if self.ad_reads >= 3:
+                    self.screen = "ad_ready"
             return 200, SCREENS[self.screen]
         if path == "/screenshot":
             return 200, self._png
@@ -161,6 +232,7 @@ class FakeWda:
             return 200, None
         if path in ("/wda/tap", "/wda/doubleTap", "/wda/touchAndHold"):
             t = self._hit(body["x"], body["y"])
+            self.pressed.append(t or "")
             if (nxt := TAPS.get((self.screen, t))):
                 self.screen = nxt
             return 200, None
@@ -173,6 +245,11 @@ class FakeWda:
                                                                   f"'{body.get('bundleId')}' unknown"}
             self.screen = BUNDLES[body["bundleId"]]
             return 200, None
+        if path == "/wda/apps/terminate":
+            if self.screen in [v for k, v in BUNDLES.items() if k == body.get("bundleId")] or \
+                    (body.get("bundleId") == "com.apple.Preferences" and self.screen in ("general", "storage")):
+                self.screen = "springboard"
+            return 200, True
         if path == "/url":
             self.screen = "web"
             return 200, None

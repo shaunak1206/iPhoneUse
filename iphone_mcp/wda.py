@@ -10,6 +10,7 @@ don't care which engine is driving.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -59,6 +60,67 @@ SKIP = {"Keyboard"}
 KEYS = {"return": "\n", "enter": "\n", "delete": "\b", "backspace": "\b", "tab": "\t", "space": " "}
 
 
+class Frames:
+    """Keeps the newest frame of the phone's MJPEG stream on a background thread,
+    so a screenshot costs nothing and "has the screen stopped moving?" can be
+    answered by comparing frames (WDA encodes an unchanged screen to the same
+    bytes)."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.jpg: bytes | None = None
+        self.at = 0.0        # when the newest frame arrived
+        self.changed = 0.0   # when the picture last changed
+        self._digest = b""
+        self._stop = False
+        threading.Thread(target=self._run, name="wda-frames", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _run(self) -> None:
+        while not self._stop:
+            try:
+                with httpx.stream("GET", self.url, timeout=httpx.Timeout(10, connect=2)) as r:
+                    buf = b""
+                    for chunk in r.iter_raw():
+                        if self._stop:
+                            return
+                        buf += chunk
+                        while True:
+                            a = buf.find(b"\xff\xd8")
+                            b = buf.find(b"\xff\xd9", a + 2) if a >= 0 else -1
+                            if b < 0:
+                                break
+                            frame, buf = buf[a:b + 2], buf[b + 2:]
+                            now = time.time()
+                            d = hashlib.blake2b(frame, digest_size=16).digest()
+                            if d != self._digest:
+                                self._digest, self.changed = d, now
+                            self.jpg, self.at = frame, now
+                        if len(buf) > 8_000_000:
+                            buf = b""
+            except Exception:
+                time.sleep(1.0)
+
+    def fresh(self, max_age: float = 0.5) -> bytes | None:
+        return self.jpg if self.jpg and time.time() - self.at < max_age else None
+
+    def wait_still(self, quiet: float = 0.2, cap: float = 1.2, min_wait: float = 0.12) -> float:
+        """Wait until the picture has not changed for `quiet` seconds (or `cap` runs
+        out: animated ads never hold still). Returns seconds waited."""
+        start = time.time()
+        time.sleep(min_wait)  # let the action start drawing
+        while time.time() - start < cap:
+            if self.fresh(0.5) is None:
+                time.sleep(max(0.0, 0.25 - (time.time() - start)))  # no stream: fall back to a short pause
+                break
+            if time.time() - self.changed >= quiet:
+                break
+            time.sleep(0.04)
+        return time.time() - start
+
+
 class Wda:
     def __init__(self, url: str | None = None) -> None:
         self._url = url or os.environ.get("IPHONE_WDA_URL")
@@ -71,6 +133,7 @@ class Wda:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._tmp = Path(tempfile.mkdtemp(prefix="iphone-wda-"))
+        self._frames: Frames | None = None
 
     # -- connection --------------------------------------------------------
 
@@ -117,16 +180,22 @@ class Wda:
 
     def _session(self) -> str:
         if not self._sid:
-            out = self._req("POST", "/session", {"capabilities": {"alwaysMatch": {}}})
+            # Waiting for the app to go quiet before each action costs ~0.1-0.4 s and never ends on pages
+            # with animated ads; the tools settle on their own after acting.
+            out = self._req("POST", "/session", {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False}}})
             self._sid = (out or {}).get("sessionId")
             if not self._sid:
                 raise BridgeError("WebDriverAgent did not open a session")
-            try:  # a smoother live view (default is 10 fps at full size, low quality)
+            try:
+                # No waiting for the app to go idle or for animations after actions (animated ads keep
+                # both running to their caps); Phone.settle watches the live frames instead. A smoother,
+                # sharper live view than the default 10 fps at quality 25.
                 self._req("POST", "/appium/settings", {"settings": {
-                    "mjpegServerFramerate": 15, "mjpegScalingFactor": 50, "mjpegServerScreenshotQuality": 50}},
+                    "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
+                    "mjpegServerFramerate": 24, "mjpegScalingFactor": 50, "mjpegServerScreenshotQuality": 55}},
                     session=True)
             except WdaError as e:
-                log("stream settings not applied:", e)
+                log("session settings not applied:", e)
         return self._sid
 
     def status(self) -> dict:
@@ -205,6 +274,9 @@ class Wda:
                     break
             URL_FILE.unlink(missing_ok=True)
             self._sid, self._ok, self._ok_until = None, False, 0.0
+            if self._frames:
+                self._frames.stop()
+                self._frames = None
         return stopped
 
     def _runner_alive(self) -> bool:
@@ -240,7 +312,45 @@ class Wda:
 
     # -- seeing ------------------------------------------------------------
 
+    def frames(self) -> Frames | None:
+        url = self.stream_url
+        if not url:
+            return None
+        if self._frames is None or self._frames.url != url:
+            if self._frames:
+                self._frames.stop()
+            self._frames = Frames(url)
+        return self._frames
+
+    def settle(self) -> float:
+        """Wait for the screen to stop changing after an action (0.1-1.2 s)."""
+        f = self.frames()
+        if f is None:
+            time.sleep(0.25)
+            return 0.25
+        return f.wait_still()
+
     def _png(self) -> bytes:
+        """The current screen as image bytes: the newest live frame if the grabber
+        has one (free), else one frame read from the stream (~0.13 s), else
+        /screenshot (~0.25 s, full resolution)."""
+        f = self.frames()
+        if f and (jpg := f.fresh(0.4)):
+            return jpg
+        if self.stream_url:
+            try:
+                with self._http.stream("GET", self.stream_url, timeout=httpx.Timeout(3, connect=1)) as r:
+                    buf = b""
+                    for chunk in r.iter_raw():
+                        buf += chunk
+                        a = buf.find(b"\xff\xd8")
+                        b = buf.find(b"\xff\xd9", a + 2) if a >= 0 else -1
+                        if b > a >= 0:
+                            return buf[a:b + 2]
+                        if len(buf) > 4_000_000:
+                            break
+            except httpx.HTTPError:
+                pass
         import base64
         return base64.b64decode(self._req("GET", "/screenshot") or "")
 
@@ -294,28 +404,36 @@ class Wda:
             return TextItem(text[:200], 1.0, max(x, 0), max(y, 0), min(rw, w - max(x, 0)), min(rh, h - max(y, 0)),
                             kind=t)
 
-        def walk(n: dict, alert: list | None) -> int:
+        def full(n: dict) -> bool:
+            r = n.get("rect") or {}
+            return float(r.get("width") or 0) * float(r.get("height") or 0) >= 0.9 * w * h
+
+        def walk(n: dict, alert: list | None) -> list[TextItem]:
             t = n.get("type") or ""
             if t in SKIP:
-                return 0
+                return []
             here = alert
             if t in ("Alert", "Sheet") and not prompt:
                 here = [[], []]
                 prompt.append(here)
             kids = n.get("children") or []
-            shown = sum(walk(k, here) for k in kids)
-            if t not in SHOWN or (t in ("Cell", "Image", "Icon") and shown and t != "Icon"):
-                return shown
+            parts = [walk(k, here) for k in kids]
+            # Siblings are drawn in order, so a full-screen layer under a later
+            # full-screen layer that shows things is covered (Chrome keeps its tab
+            # grid under the page). WebDriverAgent's own visibility check would
+            # catch this but costs seconds per read.
+            top = max((i for i, k in enumerate(kids) if full(k) and len(parts[i]) >= 3), default=-1)
+            got = [it for i, part in enumerate(parts) if not (full(kids[i]) and i < top) for it in part]
+            if t not in SHOWN or (t in ("Cell", "Image", "Icon") and got and t != "Icon"):
+                return got
             it = item(n, t)
             if not it:
-                return shown
-            items.append(it)
+                return got
             if here is not None:
                 (here[1] if t == "Button" else here[0]).append(it)
-            return shown + 1
+            return got + [it]
 
-        walk(tree, None)
-        items = _dedupe(items)
+        items = _dedupe(walk(tree, None))
         items.sort(key=lambda t: (round(t.cy / 6), t.x))
         p = None
         if prompt and prompt[0][1]:
@@ -341,13 +459,13 @@ class Wda:
         return scr.Prompt(title=lines[0] if lines else "", message=" ".join(lines[1:]),
                           buttons=[TextItem(b, 1.0, 0, 0, 0, 0, kind="alert") for b in names])
 
-    def _ocr(self, png: bytes) -> list[TextItem]:
+    def _ocr(self, png: bytes, fast: bool = False, timeout: float = 10) -> list[TextItem]:
         """Read pixels when the tree has nothing (games, video, canvas)."""
-        f = self._tmp / "screen.png"
+        f = self._tmp / "screen.img"
         f.write_bytes(png)
         try:
-            out = mirrorctl("ocr", f)
-        except BridgeError:
+            out = mirrorctl("ocr", f, *(["--fast"] if fast else []), timeout=timeout)
+        except (BridgeError, subprocess.TimeoutExpired, ValueError):
             return []
         w, h = self.phone_size()
         return [TextItem(o["text"], o["conf"], o["x"] * w, o["y"] * h, o["w"] * w, o["h"] * h)
@@ -447,6 +565,10 @@ class Wda:
 
     def launch(self, bundle_id: str) -> None:
         self._req("POST", "/wda/apps/launch", {"bundleId": bundle_id}, session=True, timeout=60)
+        self._done()
+
+    def terminate(self, bundle_id: str) -> None:
+        self._req("POST", "/wda/apps/terminate", {"bundleId": bundle_id}, session=True)
         self._done()
 
     def bundle_for(self, name: str) -> str | None:

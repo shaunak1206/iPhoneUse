@@ -140,7 +140,7 @@ async def tool_tests() -> None:
                     "phone_find", "phone_tap", "phone_long_press", "phone_swipe", "phone_scroll", "phone_type",
                     "phone_key", "phone_go", "phone_open_app", "phone_wait", "device_info", "device_apps",
                     "phone_alert", "phone_open_url", "phone_do", "phone_disconnect", "phone_watch", "phone_goto",
-                    "phone_storage_report", "phone_journal", "phone_note"}
+                    "phone_storage_report", "phone_journal", "phone_note", "phone_dismiss", "phone_keys"}
         check(expected <= tools, "all tools registered", expected - tools)
 
         set_state(screen="home")
@@ -300,6 +300,7 @@ async def tool_tests() -> None:
 async def wda_tests() -> None:
     print("webdriveragent engine")
     fake = FakeWda()
+    os.environ["IPHONE_WDA_MJPEG_PORT"] = str(fake.mjpeg_port)
     server.phone.wda._url = fake.url
     server.phone.wda._ok_until = 0
     set_state(screen="home", locked=False, running=True, screen_access=True)
@@ -382,9 +383,11 @@ async def wda_tests() -> None:
             r = text(await c.call_tool("phone_open_app", {"name": "Some Game"}))
             check(fake.typed.endswith("Some Game\n"), "unknown app goes through Spotlight", (fake.typed, r))
 
+            fake.screen = "general"  # Settings left on some other page
             r = text(await c.call_tool("phone_goto", {"place": "storage"}))
-            check(fake.called("/url")[-1] == {"url": "App-prefs:General&path=STORAGE_MGMT"} and "Went to Settings" in r,
-                  "goto opens a Settings page by link in one call", r)
+            check(fake.called("/wda/apps/terminate")[-1] == {"bundleId": "com.apple.Preferences"}
+                  and "Went to Settings > storage" in r and "Delete App" in r,
+                  "goto relaunches Settings at the top and taps through to the page", r)
             r = text(await c.call_tool("phone_goto", {"place": "nowhere"}))
             check("unknown place" in r and "storage" in r, "unknown place lists the known ones", r)
 
@@ -410,8 +413,83 @@ async def wda_tests() -> None:
             acts = web.get("/api/activity").json()
             check(any(a["action"] == "Went home." for a in acts) and any(not a["ok"] for a in acts),
                   "activity feed has actions and stops", acts[-3:])
+            os.environ["IPHONE_WDA_MJPEG_PORT"] = "9"  # nothing listens there
             r6 = web.get("/stream")
             check(r6.status_code == 503, "stream says when the phone's stream is unreachable", r6.status_code)
+            os.environ["IPHONE_WDA_MJPEG_PORT"] = str(fake.mjpeg_port)
+
+            print("speed tools")
+            fake.screen = "chrome"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("Inactive tabs" not in r and "Tabs not used" not in r and "Play" in r,
+                  "a full-screen layer under the page (Chrome's tab grid) is left out", r)
+            fake.screen = "home2"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("[app] Weather" in r and "[app] Home" in r, "an empty layer on top hides nothing", r)
+            fake.screen, fake.ad_reads = "ad", 0
+            r = text(await c.call_tool("phone_dismiss", {}))
+            check("Closed 'Continue to Wordle'" in r and "n present" in r, "dismiss waits out an ad countdown", r)
+            fake.screen = "cookies"
+            r = text(await c.call_tool("phone_dismiss", {}))
+            check("Closed 'Reject'" in r and "Example Domain" in r, "cookie banner gets Reject, never Accept", r)
+            r = text(await c.call_tool("phone_dismiss", {}))
+            check(r.startswith("Nothing to dismiss"), "nothing in the way, nothing tapped", r)
+            fake.screen, fake.pressed = "wordle", []
+            r = text(await c.call_tool("phone_keys", {"keys": "crane", "then": "enter"}))
+            check(fake.pressed == ["c absent", "r absent", "a absent", "n present", "e absent", "enter"]
+                  and "Pressed crane [enter]" in r, "keys taps a word on a page keyboard, labels with states too",
+                  (fake.pressed, r[:120]))
+            reads = len(fake.called("/source"))
+            fake.pressed = []
+            r = text(await c.call_tool("phone_do", {"steps": [{"keys": "zq"}, {"taps": ["add x", "enter"]}]}))
+            check(fake.pressed == ["add z", "add q", "add x", "enter"] and "2. Tapped 'add x', 'enter'" in r,
+                  "keys and taps steps in a batch", (fake.pressed, r[:200]))
+            check(len(fake.called("/source")) - reads <= 3, "each batch of taps costs one screen read",
+                  len(fake.called("/source")) - reads)
+            r = text(await c.call_tool("phone_keys", {"keys": "7"}))
+            check("no on-screen key for '7'" in r, "missing key explained", r[:80])
+
+            print("frames, marks, recording")
+            import time as _t
+            w = server.phone.wda
+            w.frames()
+            for _ in range(50):
+                if w._frames.fresh():
+                    break
+                _t.sleep(0.05)
+            t0 = _t.time()
+            png = w._png()
+            check(png[:2] == b"\xff\xd8" and _t.time() - t0 < 0.05, "screenshot is the newest live frame (no request)",
+                  _t.time() - t0)
+            fake.moving = 0
+            waited = w.settle()
+            check(0.1 <= waited < 0.5, "settle returns soon once the picture holds still", waited)
+            fake.moving = 30  # about one second of changing frames
+            waited = w.settle()
+            check(waited >= 0.8, "settle waits while the picture changes (capped)", waited)
+            fake.screen = "settings"
+            r = await c.call_tool("phone_screenshot", {"marks": True})
+            kinds = [getattr(x, "type", "") for x in r.content]
+            legend = r.content[1].text if len(r.content) > 1 else ""
+            check(kinds == ["image", "text"] and "#1 " in legend and "General" in legend, "marked screenshot + legend",
+                  legend[:200])
+            n = next(int(line.split()[0][1:]) for line in legend.splitlines() if line.endswith("General"))
+            r = text(await c.call_tool("phone_tap", {"text": f"#{n}"}))
+            check(f"Tapped #{n} 'General'" in r and "iPhone Storage" in r, "tap by mark number", r[:160])
+            r = text(await c.call_tool("phone_tap", {"text": "#999"}))
+            check("no mark #999" in r, "unknown mark explained", r[:80])
+            import shutil
+            if shutil.which("ffmpeg") or os.path.exists("/opt/homebrew/bin/ffmpeg"):
+                iphone_mcp.phone.RECORDINGS = TMP / "rec"
+                iphone_mcp.phone.RECORD_PID = TMP / "record.pid"
+                r = text(await c.call_tool("phone_record", {"action": "start", "name": "t"}))
+                await asyncio.sleep(1.5)
+                r2 = text(await c.call_tool("phone_record", {"action": "stop"}))
+                f = TMP / "rec" / "t.mp4"
+                check(r.startswith("Recording to") and r2.startswith("Saved") and f.exists() and f.stat().st_size > 1000,
+                      "records the live screen to an MP4", (r, r2, f.exists() and f.stat().st_size))
+                r = text(await c.call_tool("phone_record", {"action": "stop"}))
+                check("not recording" in r, "stop when not recording explained", r)
 
             fake.locked = True
             server.phone.wda._ok_until = 0

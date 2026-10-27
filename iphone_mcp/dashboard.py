@@ -11,6 +11,7 @@ apps:
     GET  /api/status           GET /api/screen          GET /api/activity?since=<t>
     POST /api/connect          POST /api/disconnect
     POST /api/do {"steps": [...]}    POST /api/goto {"place": "storage"}
+    POST /api/record {"action": "start" | "stop"}
     GET  /api/storage?deep=1   GET /stream (MJPEG)
 
 It listens on 127.0.0.1 only. Requests that act need the header
@@ -21,6 +22,7 @@ browser cannot drive the phone.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -78,7 +80,20 @@ def app(phone=None):
         return JSONResponse({"ok": True, "pid": os.getpid()})
 
     async def status(req: Request) -> Response:
-        return await run(req, phone.status, acting=False)
+        async def go():
+            out = await phone.status()
+            out["recording"] = phone.recording()
+            return out
+        return await run(req, go, acting=False)
+
+    async def record(req: Request) -> Response:
+        body = await req.json()
+
+        async def go():
+            if body.get("action") == "start":
+                return {"recording": await asyncio.to_thread(phone.record_start, body.get("name"))}
+            return {"saved": await asyncio.to_thread(phone.record_stop)}
+        return await run(req, go)
 
     async def screen_(req: Request) -> Response:
         async def go():
@@ -171,6 +186,7 @@ def app(phone=None):
         Route("/api/activity", activity), Route("/api/storage", storage_), Route("/stream", stream),
         Route("/api/connect", connect, methods=["POST"]), Route("/api/disconnect", disconnect, methods=["POST"]),
         Route("/api/do", do, methods=["POST"]), Route("/api/goto", goto, methods=["POST"]),
+        Route("/api/record", record, methods=["POST"]),
     ]
     return Starlette(routes=routes)
 

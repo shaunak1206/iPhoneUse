@@ -18,6 +18,7 @@ iphone_mcp/
   bridge.py      iPhone Mirroring engine (mirrorctl helper: capture, OCR, mouse/keys)
   screen.py      readouts, text matching, prompt detection, safety rules (RISKY/GRANT/DECLINE)
   storage.py     storage report: lockdown app sizes + parallel AFC du of the media partition
+recipes/games.py         Wordle / spellbee.org / Connections in Chrome, one call per move
   journal.py     run journal in the private repo shaunak1206/iphone-agent-journal (gh api)
   device.py      lockdown helpers (pymobiledevice3)
 bridge/mirrorctl.swift   Swift helper for Mirroring (built to bin/, gitignored)
@@ -72,8 +73,21 @@ scrolls starting at the screen edge.
 - Killing xcodebuild leaves the phone's "Automation Running" banner (testmanagerd
   keeps the session and ignores SIGTERM). Stop with GET `/wda/shutdown`.
 - Campus Wi-Fi blocks Bonjour: CoreDevice cannot find the phone, so the runner can
-  only be started over USB. Unicast works, so a running runner is reachable over
-  Wi-Fi at the address it prints.
+  only be started over USB, and unplugging ends it (the xcodebuild test session
+  runs over the USB CoreDevice tunnel; verified). Unicast works, so the runner's
+  HTTP and MJPEG are reached over Wi-Fi while the cable is in. Untested way out:
+  pymobiledevice3 `create_using_tcp(ip)` + `CoreDeviceTunnelProxy` + `XCUITestService`.
+- Vision OCR stalls 30-45 s inside the long-lived `mirrorctl serve` helper on
+  macOS 27 but takes 0.3-0.7 s one-off; `bridge.run("ocr")` runs one-off and
+  Mirror.capture falls back to that when the helper times out.
+- Session settings that matter: `shouldWaitForQuiescence: false` (capability),
+  `waitForIdleTimeout: 0`, `animationCoolOffTimeout: 0`; then `Wda.settle` waits for
+  MJPEG frames to stop changing (WDA encodes an unchanged screen to identical
+  bytes). Taps measure ~0.6 s either way; the win is no multi-second stalls on
+  animated pages. Chrome keeps its tab grid as a full-screen layer under the page;
+  `_items` drops a full-screen layer covered by a later one that shows things.
+- iOS 26 ignores the path in `App-prefs:` links (they just open Settings where it
+  was); `goto` terminates and relaunches Settings, then taps through.
 - The lockdown install service leaves out app-group data (WhatsApp's 3.6 GB), and
   offloaded apps are not listed. The iPhone Storage screen is the ground truth.
 - AFC: Photos' caches are ~45k files; the media scan splits second-level folders

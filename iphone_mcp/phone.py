@@ -27,31 +27,48 @@ from .bridge import ROOT, BridgeError, Mirror, Screen, log
 from .wda import Wda, WdaError
 
 ACTIVITY_FILE = ROOT / "build" / "activity.jsonl"
+RECORDINGS = ROOT / "build" / "recordings"
+RECORD_PID = ROOT / "build" / "record.pid"
 
-# Settings pages by plain name. WebDriverAgent opens these as URLs, so one call
-# replaces three or four taps; under Mirroring they are reached by tapping.
+# Settings pages by plain name, as the rows to tap from the top of Settings.
+# (iOS 26 ignores the path in App-prefs: links, so pages are reached by tapping;
+# Settings is relaunched first so it starts at its top level.)
 SETTINGS = {
-    "settings": ("App-prefs:", []),
-    "general": ("App-prefs:General", ["General"]),
-    "storage": ("App-prefs:General&path=STORAGE_MGMT", ["General", "iPhone Storage"]),
-    "about": ("App-prefs:General&path=About", ["General", "About"]),
-    "software update": ("App-prefs:General&path=SOFTWARE_UPDATE_LINK", ["General", "Software Update"]),
-    "background refresh": ("App-prefs:General&path=AUTO_CONTENT_DOWNLOAD", ["General", "Background App Refresh"]),
-    "vpn & device management": ("App-prefs:General&path=ManagedConfigurationList",
-                                ["General", "VPN & Device Management"]),
-    "wifi": ("App-prefs:WIFI", ["Wi-Fi"]),
-    "bluetooth": ("App-prefs:Bluetooth", ["Bluetooth"]),
-    "cellular": ("App-prefs:MOBILE_DATA_SETTINGS_ID", ["Cellular"]),
-    "battery": ("App-prefs:BATTERY_USAGE", ["Battery"]),
-    "notifications": ("App-prefs:NOTIFICATIONS_ID", ["Notifications"]),
-    "screen time": ("App-prefs:SCREEN_TIME", ["Screen Time"]),
-    "privacy": ("App-prefs:Privacy", ["Privacy & Security"]),
-    "location": ("App-prefs:Privacy&path=LOCATION", ["Privacy & Security", "Location Services"]),
-    "display": ("App-prefs:DISPLAY", ["Display & Brightness"]),
-    "photos settings": ("App-prefs:Photos", ["Apps", "Photos"]),
-    "messages settings": ("App-prefs:MESSAGES", ["Apps", "Messages"]),
-    "icloud": ("App-prefs:CASTLE", []),
+    "settings": [],
+    "general": ["General"],
+    "storage": ["General", "iPhone Storage"],
+    "about": ["General", "About"],
+    "software update": ["General", "Software Update"],
+    "background refresh": ["General", "Background App Refresh"],
+    "vpn & device management": ["General", "VPN & Device Management"],
+    "wifi": ["Wi-Fi"],
+    "bluetooth": ["Bluetooth"],
+    "cellular": ["Cellular"],
+    "battery": ["Battery"],
+    "notifications": ["Notifications"],
+    "screen time": ["Screen Time"],
+    "privacy": ["Privacy & Security"],
+    "location": ["Privacy & Security", "Location Services"],
+    "display": ["Display & Brightness"],
+    "apps": ["Apps"],
+    "photos settings": ["Apps", "Photos"],
+    "messages settings": ["Apps", "Messages"],
+    "icloud": ["Apple Account", "iCloud"],
 }
+
+
+# Controls that close an overlay, best first. Cookie banners get the
+# privacy-preserving answer. Single-letter "X" closers come last.
+CLOSERS = [r"continue to .+", r"skip( ad)?", r"close( ad)?", r"dismiss", r"no,? thanks?( you)?", r"not now",
+           r"maybe later", r"later", r"got it", r"reject( all)?", r"(use )?necessary( cookies)? only", r"decline",
+           r"[x×✕✖]"]
+COUNTDOWN = re.compile(r"(skip|close|continue)[^0-9]{0,20}\d+\s*(s|sec|seconds?)\b|ad will (end|close)", re.IGNORECASE)
+
+
+def _key_pattern(k: str) -> re.Pattern:
+    """An on-screen keyboard key for k: 'q', 'add q', 'q absent', 'Q key', ..."""
+    return re.compile(rf"(?:add |key |type |letter )?{re.escape(k)}(?:,? (?:absent|present|correct|key|button))?",
+                      re.IGNORECASE)
 
 
 class Refused(Exception):
@@ -66,6 +83,7 @@ class Phone:
         self._lock = asyncio.Lock()
         self._installed: dict[str, str] | None = None
         self.activity: deque[dict] = deque(maxlen=200)
+        self.marks: list[screen.TextItem] = []  # from the last marked screenshot, for tap "#n"
 
     # -- plumbing ----------------------------------------------------------
 
@@ -79,8 +97,17 @@ class Phone:
 
     @property
     def settle(self) -> float:
-        # WebDriverAgent already waits for the app to go idle after each action.
+        """A fixed pause after an action, for engines that cannot watch the screen."""
         return 0.25 if isinstance(self.eng(), Wda) else 0.8
+
+    async def settle_screen(self) -> None:
+        """After an action: under WebDriverAgent wait until the live frames stop
+        changing (0.1-1.2 s), otherwise a fixed pause."""
+        e = self.eng()
+        if isinstance(e, Wda):
+            await asyncio.to_thread(e.settle)
+        else:
+            await asyncio.sleep(self.settle)
 
     async def io(self, fn, *a, **kw):
         """Engine calls block (subprocesses, HTTP); keep them off the event loop
@@ -104,7 +131,11 @@ class Phone:
         return await self.io(self.eng().capture, image=image, ocr=True)
 
     async def after(self, action: str, settle: float | None = None) -> str:
-        s = await self.read(settle=self.settle if settle is None else settle)
+        if settle is None:
+            await self.settle_screen()
+        elif settle:
+            await asyncio.sleep(settle)
+        s = await self.read()
         return f"{action}\n\n{screen.describe(s)}"
 
     async def fresh(self, max_age: float = 1.5) -> Screen:
@@ -133,6 +164,13 @@ class Phone:
                       ) -> tuple[float, float, list[screen.TextItem], str, screen.Prompt | None]:
         """Turn (x, y) or text into a tap point, the labels under it, and the prompt
         on screen (if any) so a prompt answer is judged with its question."""
+        if text and re.fullmatch(r"#\d+", text.strip()):
+            n = int(text.strip()[1:])
+            if not 1 <= n <= len(self.marks):
+                raise ValueError(f"no mark {text}; take phone_screenshot(marks=true) first "
+                                 f"({len(self.marks)} marks now)")
+            it = self.marks[n - 1]
+            return it.cx, it.cy, [it], f"#{n} '{it.text}' at ({it.cx:.0f},{it.cy:.0f})", None
         if text:
             s = await self.fresh()
             hits = screen.find(s, text, exact=exact)
@@ -404,22 +442,21 @@ class Phone:
         key = place.strip().lower()
         if key not in SETTINGS:
             raise ValueError(f"unknown place {place!r}; known: {', '.join(sorted(SETTINGS))}")
-        link, taps = SETTINGS[key]
         e = self.eng()
+        await self.io(e.require)
         if isinstance(e, Wda):
-            try:
-                await self.io(e.require)
-                await self.io(e.open_url, link)
-                await asyncio.sleep(0.8)
-                return self._did(f"Went to Settings > {place} (`{link}`).")
-            except WdaError as err:
-                log(f"settings link {link} refused, tapping instead:", err)
-        await self.open_app("Settings")
-        for label in taps:
-            await self.find(label, scroll=True)
-            await self.tap(text=label, exact=True)
-            await asyncio.sleep(self.settle)
-        return self._did(f"Went to Settings > {place} (by tapping).")
+            await self.io(e.terminate, "com.apple.Preferences")  # reopen at the top, not the last page
+            await self.io(e.launch, "com.apple.Preferences")
+            await asyncio.sleep(0.6)
+        else:
+            await self.open_app("Settings")
+        for label in SETTINGS[key]:
+            s = await self.read()
+            if not screen.find(s, label):
+                await self.find(label, scroll=True)
+            await self.tap(text=label)
+            await asyncio.sleep(self.settle + 0.3)
+        return self._did(f"Went to Settings > {place}.")
 
     async def alert(self, button: str, confirm: bool = False) -> str:
         s = await self.read()
@@ -474,6 +511,99 @@ class Phone:
                 raise ValueError(f"{text!r} not found; reached the end of the view.\n\n{screen.describe(after)}")
         raise ValueError(f"{text!r} not found.\n\n{screen.describe(self.eng().last or await self.read())}")
 
+    async def taps(self, targets: list, confirm: bool = False) -> str:
+        """Tap several labels (or [x, y] points) in order, resolved from one screen
+        read, without reading in between: menus, pickers, a row of buttons."""
+        def resolve(s: Screen) -> list[tuple[float, float, str]]:
+            p = screen.prompt(s)
+            out = []
+            for t in targets:
+                if isinstance(t, (list, tuple)):
+                    out.append((float(t[0]), float(t[1]), f"({t[0]},{t[1]})"))
+                    continue
+                hits = screen.find(s, str(t))
+                if not hits:
+                    raise ValueError(f"no text matching {t!r} on screen.\n\n{screen.describe(s)}")
+                self.guard([hits[0]], p, confirm)
+                out.append((hits[0].cx, hits[0].cy, hits[0].text))
+            return out
+
+        points = await self._from_screen(resolve)
+        for x, y, _ in points:
+            await self.io(self.eng().tap, x, y)
+        return self._did("Tapped " + ", ".join(f"'{lbl}'" for _, _, lbl in points) + ".")
+
+    async def _from_screen(self, resolve):
+        """resolve(screen) on the cached read; if it fails there, once more on a new read
+        (the page may have changed by itself since)."""
+        s = await self.fresh()
+        try:
+            return resolve(s)
+        except ValueError:
+            if s is not self.eng().last:
+                raise
+            return resolve(await self.read())
+
+    async def keys(self, keys: str | list[str]) -> str:
+        """Type on an on-screen keyboard drawn by the app or page (games like Wordle,
+        PIN-less keypads): "crane" taps c, r, a, n, e; a list may add named keys like
+        "enter" or "backspace". One screen read, then every tap back to back."""
+        seq = list(keys) if isinstance(keys, str) else keys
+
+        def resolve(s: Screen) -> list[tuple[float, float]]:
+            cands = [it for it in s.items if len(it.text) <= 24]
+            out = []
+            for k in seq:
+                pat = _key_pattern(k) if len(k) == 1 else re.compile(rf"{re.escape(k)}( key)?", re.IGNORECASE)
+                hit = next((it for it in cands if pat.fullmatch(it.text.strip())), None)
+                if not hit:
+                    raise ValueError(f"no on-screen key for {k!r}.\n\n{screen.describe(s)}")
+                out.append((hit.cx, hit.cy))
+            return out
+
+        points = await self._from_screen(resolve)
+        for x, y in points:
+            await self.io(self.eng().tap, x, y)
+        return self._did(f"Pressed {''.join(k if len(k) == 1 else f' [{k}] ' for k in seq).strip()} on the on-screen keys.")
+
+    async def dismiss(self, rounds: int = 4, wait_ads: float = 12) -> str:
+        """Clear whatever is in the way: system prompts (safe answer), ads ("Continue",
+        "Skip", waiting out countdowns), close buttons and X's, cookie banners (Reject).
+        Several layers in one call."""
+        done: list[str] = []
+        waited = 0.0
+        e = self.eng()
+        for _ in range(rounds + int(wait_ads)):
+            s = await self.read()
+            p = screen.prompt(s)
+            if p and any(screen.clean(b.text) in screen.DECLINE for b in p.buttons):
+                done.append(await self.alert("dismiss"))
+                await asyncio.sleep(self.settle)
+                continue
+            hit = None
+            for pat in CLOSERS:
+                rx = re.compile(pat, re.IGNORECASE)
+                hit = next((it for it in s.items if rx.fullmatch(screen.clean(it.text))
+                            and not screen.needs_confirm(it, p)), None)
+                if hit:
+                    break
+            if hit is None and isinstance(e, Wda):  # an X drawn without a label: read the pixels
+                ocr = await asyncio.to_thread(e._ocr, await self.io(e._png), True, 5)
+                hit = next((it for it in ocr if it.text.strip() in ("X", "×", "✕", "✖") and it.cy < 0.4 * s.height), None)
+            if hit is not None:
+                await self.io(e.tap, hit.cx, hit.cy)
+                done.append(self._did(f"Closed '{hit.text}' at ({hit.cx:.0f},{hit.cy:.0f})."))
+                await self.settle_screen()
+                if len(done) >= rounds:
+                    break
+                continue
+            if waited < wait_ads and any(COUNTDOWN.search(it.text) for it in s.items):
+                await asyncio.sleep(1.0)
+                waited += 1.0
+                continue
+            break
+        return " ".join(done) if done else "Nothing to dismiss."
+
     def _did(self, line: str) -> str:
         self.record(line)
         return line
@@ -484,6 +614,8 @@ class Phone:
         "go": "home|back|app_switcher|spotlight", "scroll": "down|up|left|right (+ amount)",
         "swipe": "up|down|left|right (+ distance)", "alert": "button name or 'dismiss'",
         "find": "text (+ scroll: true)", "wait_for": "text (+ timeout)", "wait": "seconds",
+        "taps": "[label or [x, y], ...] from one read", "keys": "on-screen keyboard: 'crane' or ['c', 'enter']",
+        "dismiss": "close ads, popups, X's, cookie banners (true)",
     }
 
     async def do(self, steps: list[dict[str, Any]]) -> str:
@@ -505,6 +637,8 @@ class Phone:
                     if act in ("tap", "long_press"):
                         where = {"text": arg} if isinstance(arg, str) else {"x": arg[0], "y": arg[1]}
                         line = await getattr(self, act)(**where, **opt)
+                    elif act == "dismiss":
+                        line = await self.dismiss(**opt)
                     else:
                         fn = {"wait": self.sleep}.get(act) or getattr(self, act)
                         line = await fn(arg, **opt)
@@ -515,11 +649,89 @@ class Phone:
                     self.record(f"{act} stopped: {str(e).splitlines()[0]}", ok=False)
                     return "\n".join(done) + "\n\nRemaining steps were not run."
                 done.append(f"{i}. {line}")
-                if act not in ("wait", "wait_for", "find"):
-                    await asyncio.sleep(self.settle)
+                if act not in ("wait", "wait_for", "find", "dismiss"):
+                    await self.settle_screen()
         finally:
             await self.io(active.release_focus)
         return "\n".join(done) + "\n\n" + screen.describe(await self.read())
+
+    # -- seeing -------------------------------------------------------------
+
+    async def marked(self) -> tuple[bytes, str]:
+        """Screenshot with a numbered box on every element (set-of-marks), plus the
+        legend. Tap one with tap(text="#n")."""
+        s = await self.io(self.eng().capture, image=True, ocr=True)
+        assert s.jpg is not None
+        self.marks = list(s.items)
+        from PIL import Image, ImageDraw
+        import io as _io
+        im = Image.open(_io.BytesIO(s.jpg)).convert("RGB")
+        k = im.width / s.width
+        d = ImageDraw.Draw(im)
+        for n, it in enumerate(self.marks, 1):
+            box = (it.x * k, it.y * k, (it.x + it.w) * k, (it.y + it.h) * k)
+            d.rectangle(box, outline=(255, 45, 85), width=2)
+            tag = str(n)
+            tw = 7 * len(tag) + 4
+            d.rectangle((box[0], box[1], box[0] + tw, box[1] + 13), fill=(255, 45, 85))
+            d.text((box[0] + 2, box[1]), tag, fill=(255, 255, 255))
+        out = _io.BytesIO()
+        im.save(out, "JPEG", quality=80)
+        legend = "\n".join(f"#{n} {screen._tag(it)}{it.text}" for n, it in enumerate(self.marks, 1))
+        return out.getvalue(), legend
+
+    # -- recording ---------------------------------------------------------
+
+    def record_start(self, name: str | None = None) -> str:
+        """Record the phone's live screen (WebDriverAgent's stream) to an MP4 with
+        ffmpeg, in the background until record_stop()."""
+        import shutil
+        if self.recording():
+            raise ValueError("already recording; stop it first")
+        src = self.wda.stream_url
+        if not src or not self.wda.ready():
+            raise ValueError("recording needs WebDriverAgent running (phone_connect)")
+        ff = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+        if not os.path.exists(ff):
+            raise ValueError("ffmpeg is not installed (brew install ffmpeg)")
+        RECORDINGS.mkdir(parents=True, exist_ok=True)
+        path = RECORDINGS / f"{name or time.strftime('%Y-%m-%d-%H%M%S')}.mp4"
+        proc = subprocess.Popen([ff, "-y", "-loglevel", "error", "-f", "mpjpeg", "-i", src, "-vf",
+                                 "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-r", "24", "-c:v", "libx264", "-preset",
+                                 "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        RECORD_PID.write_text(f"{proc.pid}\n{path}")
+        self.record(f"Started recording {path.name}")
+        return str(path)
+
+    def recording(self) -> str | None:
+        if not RECORD_PID.exists():
+            return None
+        pid, path = RECORD_PID.read_text().split("\n", 1)
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError):
+            RECORD_PID.unlink(missing_ok=True)
+            return None
+        return path
+
+    def record_stop(self) -> str:
+        path = self.recording()
+        if not path:
+            raise ValueError("not recording")
+        pid = int(RECORD_PID.read_text().split("\n", 1)[0])
+        import signal
+        os.kill(pid, signal.SIGINT)  # ffmpeg finishes the file on SIGINT
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+        RECORD_PID.unlink(missing_ok=True)
+        self.record(f"Saved recording {os.path.basename(path)}")
+        return path
 
     # -- watching ----------------------------------------------------------
 

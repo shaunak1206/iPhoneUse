@@ -5,6 +5,9 @@
     iphone open Settings              iphone goto storage
     iphone tap "General"              iphone type "hello" --submit
     iphone home | back                iphone url maps.apple.com/?q=coffee
+    iphone dismiss                    iphone keys crane --then enter
+    iphone marks shot.jpg             iphone tap "#12"
+    iphone record start | stop
     iphone do '[{"goto":"battery"},{"wait_for":"Battery Health"}]'
     iphone storage [--deep] [--json]  iphone live
     iphone journal                    iphone note "keep the Tesla app: it is the car key"
@@ -54,6 +57,21 @@ async def run(a: argparse.Namespace) -> str:
         return await p.after(await p.open_url(a.url), settle=0)
     if c == "goto":
         return await p.after(await p.goto(a.place))
+    if c == "record":
+        if a.action == "start":
+            return f"recording to {p.record_start(a.name)}"
+        if a.action == "stop":
+            return f"saved {p.record_stop()}"
+        return p.recording() or "not recording"
+    if c == "marks":
+        jpg, legend = await p.marked()
+        with open(a.file, "wb") as f:
+            f.write(jpg)
+        return f"saved {a.file}\n{legend}"
+    if c == "dismiss":
+        return await p.after(await p.dismiss())
+    if c == "keys":
+        return await p.after(await p.keys(list(a.keys) + ([a.then] if a.then else [])))
     if c in ("home", "back"):
         return await p.after(await p.go(c))
     if c == "do":
@@ -77,7 +95,7 @@ async def run(a: argparse.Namespace) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(prog="iphone", description="Control a real iPhone from the Mac.")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("status", "stop", "read", "home", "back", "live", "mcp"):
+    for name in ("status", "stop", "read", "home", "back", "live", "mcp", "dismiss"):
         sub.add_parser(name)
     sub.add_parser("connect").add_argument("--engine", choices=["auto", "wda", "mirror"], default="auto")
     sub.add_parser("shot").add_argument("file", nargs="?", default="screen.jpg")
@@ -87,6 +105,14 @@ def main() -> None:
     ty = sub.add_parser("type")
     ty.add_argument("text")
     ty.add_argument("--submit", action="store_true")
+    k = sub.add_parser("keys", help="tap an on-screen keyboard drawn by the app or page")
+    k.add_argument("keys")
+    k.add_argument("--then", help="a named key after, e.g. enter")
+    rec = sub.add_parser("record", help="record the phone's screen to an MP4")
+    rec.add_argument("action", choices=["start", "stop", "status"])
+    rec.add_argument("--name")
+    sub.add_parser("marks", help="screenshot with numbered boxes; tap one with: iphone tap '#12'").add_argument(
+        "file", nargs="?", default="marks.jpg")
     sub.add_parser("open").add_argument("app")
     sub.add_parser("url").add_argument("url")
     sub.add_parser("goto").add_argument("place", choices=sorted(SETTINGS))

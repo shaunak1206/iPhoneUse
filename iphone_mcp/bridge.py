@@ -90,6 +90,15 @@ _helper = _Helper()
 
 
 def run(*args: object, timeout: float = 30) -> dict:
+    if args and args[0] == "ocr":
+        # Vision stalls for 30-45 s inside the long-lived `serve` helper (seen on macOS 27) but
+        # takes ~0.3-0.7 s as a one-off process, so OCR of saved images runs one-off.
+        ensure_built()
+        r = subprocess.run([str(BIN), *map(str, args)], capture_output=True, text=True, timeout=timeout)
+        out = json.loads(r.stdout or "{}")
+        if "error" in out:
+            raise BridgeError(f"mirrorctl {args[0]}: {out['error']}")
+        return out
     out = _helper.call([str(a) for a in args], timeout)
     if "error" in out:
         raise BridgeError(out["error"])
@@ -275,7 +284,18 @@ class Mirror:
             args.append("--ocr")
             if fast:
                 args.append("--fast")
-        out = run(*args)
+        try:
+            out = run(*args, timeout=8 if ocr else 30)
+        except BridgeError as e:
+            if not ocr or "timed out" not in str(e):
+                raise
+            # Vision can stall inside the long-lived helper; capture without OCR, then read the
+            # picture in a one-off process (~0.5 s).
+            shot = self._tmp / "ocr.jpg"
+            out = run(*self._shot_args(win), "--jpg", shot, "--width", int(pw * 2))
+            out["ocr"] = run("ocr", shot, *(["--fast"] if fast else [])).get("ocr", [])
+            if image:
+                run(*self._shot_args(win), "--jpg", jpg, "--width", image_width or int(pw))
         self._remember(win, out)
         items = [
             TextItem(o["text"], o["conf"], o["x"] * pw, o["y"] * ph, o["w"] * pw, o["h"] * ph)

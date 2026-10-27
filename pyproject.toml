@@ -13,6 +13,9 @@ dependencies = [
   "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+games = ["wordfreq>=3.1"]
+
 [project.scripts]
 iphone = "iphone_mcp.cli:main"
 iphone-mcp = "iphone_mcp.server:main"

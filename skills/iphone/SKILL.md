@@ -27,9 +27,9 @@ the user's real iPhone from the Mac. Same powers from a shell: the `iphone` CLI
 | Speed | ~1-2 s per action | ~2-3 s per action |
 | Starts with | `phone_connect` (about 10 s) | `phone_connect` (needs Touch ID on the Mac once) |
 
-Starting WebDriverAgent needs the phone **on the cable** on networks that block
-device discovery (the user's campus Wi-Fi, Moontower, does). Once it runs it keeps
-working over Wi-Fi. If `phone_connect` says the phone is not reachable, ask the
+On the user's campus Wi-Fi (Moontower), WebDriverAgent needs the phone **on the
+cable** the whole time: the network blocks device discovery, and unplugging ends
+the runner's test session. If `phone_connect` says the phone is not reachable, ask the
 user to plug it in. While it runs the phone shows "Automation Running"; call
 `phone_disconnect` when done (it also stops itself after 2 minutes idle).
 
@@ -48,11 +48,18 @@ the whole task, then:
    [{"goto": "storage"}, {"wait_for": "Recommendations", "timeout": 20},
     {"find": "Spotify", "scroll": true}, {"tap": "Spotify"}]
    ```
-3. **Every action already returns the next screen.** Do not follow an action with
-   `phone_read_screen`. Use `phone_screenshot` only when you must see an image or
-   an icon without a label.
-4. **Tap by text** (`phone_tap(text=...)`). Coordinates only for unlabeled things.
-5. `phone_scroll` moves exactly the amount asked (no fling); `phone_find(text,
+3. **Something in the way?** `phone_dismiss` clears ads (and waits out "Skip in
+   5 s"), popups, X's and cookie banners (always Reject) in one call. Don't hunt
+   for close buttons by hand.
+4. **Keyboards drawn by the app or page** (Wordle, keypads, games): `phone_keys("crane",
+   then="enter")` taps the whole word from one read. A row of known buttons:
+   `{"taps": ["A", "B", "Submit"]}` in `phone_do`.
+5. **Never sleep a fixed time.** `wait_for` a text; actions already wait until the
+   screen stops changing.
+6. **Every action already returns the next screen.** Do not follow an action with
+   `phone_read_screen`. Unlabeled icon? `phone_screenshot(marks=true)` numbers every
+   element; then `phone_tap(text="#12")`.
+7. `phone_scroll` moves exactly the amount asked (no fling); `phone_find(text,
    scroll=true)` scrolls until something shows up.
 
 ## Prompts and safety
@@ -75,7 +82,10 @@ the whole task, then:
 - **Change a setting:** `phone_goto(place)`, then one `phone_do` with the taps.
   Switch rows report `[switch] Name [on|off]`, and their tap point is the toggle.
 - **Find something in an app:** `phone_open_app`, then `phone_find(text, scroll=true)`.
-- **Show the user:** `phone_watch`, then act; they watch live.
+- **Show the user:** `phone_watch`, then act; they watch live. To keep a video:
+  `phone_record("start")` ... `phone_record("stop")` (MP4 under `~/iPhoneMCP/build/recordings`).
+- **Web games and pages in Chrome:** see `~/iPhoneMCP/recipes/games.py` (Wordle,
+  spellbee.org, Connections): fresh incognito tab, one call per move.
 
 ## Remember things
 

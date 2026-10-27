@@ -90,6 +90,7 @@
         <button data-step='{"go":"home"}'>Home</button>
         <button data-step='{"go":"back"}'>Back</button>
         <button data-goto="storage">iPhone Storage</button>
+        <button data-record id="recbtn">Record</button>
       </div>
       <div class="notice" id="notice"></div>
     </section>
@@ -113,7 +114,7 @@
   const H = { "X-iPhone-Agent": "1", "Content-Type": "application/json" };
   const $ = id => document.getElementById(id);
   const gb = n => n >= 1e8 ? (n / 1e9).toFixed(2) + " GB" : Math.round(n / 1e6) + " MB";
-  let streaming = false, lastT = 0;
+  let streaming = false, lastT = 0, recording = null;
 
   function notice(text) { const n = $("notice"); n.textContent = text || ""; n.classList.toggle("show", !!text); }
 
@@ -150,6 +151,10 @@
     if (b.dataset.goto) act(async () => { const r = await post("/api/goto", { place: b.dataset.goto });
                                           if (r.error) notice(explain(r.error)); });
     if (b.dataset.storage) act(() => storage(b.dataset.storage === "1"));
+    if ("record" in b.dataset) act(async () => {
+      const r = await post("/api/record", { action: recording ? "stop" : "start" });
+      notice(r.error ? explain(r.error) : r.saved ? "Saved " + r.saved : "Recording the phone's screen…");
+    });
   });
 
   async function storage(deep) {
@@ -180,6 +185,8 @@
     $("lock").textContent = w.reachable ? (w.locked ? "Locked" : "Unlocked") + (w.ios ? " · iOS " + w.ios : "") : "–";
     $("app").textContent = w.app || "–";
     $("phone").classList.toggle("down", !live);
+    recording = s.recording; $("recbtn").textContent = recording ? "● Stop recording" : "Record";
+    $("recbtn").disabled = !live && !recording;
     if (live && !streaming) { streaming = true; $("screen").src = "/stream?t=" + Date.now(); }
     if (!live && streaming) { streaming = false; $("screen").removeAttribute("src"); }
   }

@@ -106,7 +106,10 @@ item comes with its tap point, so most steps don't need an image at all.
 | `phone_type`, `phone_key` | typing into the focused field |
 | `phone_go` | `home`, `app_switcher`, `spotlight`, `back` |
 | `phone_alert` | read or answer an alert / permission prompt / confirmation sheet; `button="dismiss"` is the safe way out |
-| `phone_read_screen`, `phone_screenshot`, `phone_zoom`, `phone_find`, `phone_wait` | seeing and waiting |
+| `phone_dismiss` | clear whatever is in the way in one call: ads (waits out "Skip in 5 s"), popups, X's (labelled or drawn), cookie banners (always Reject) |
+| `phone_keys` | type on a keyboard drawn by an app or page (Wordle, keypads): `"crane"` + `then="enter"`, one read then back-to-back taps |
+| `phone_record` | record the live screen to an MP4 (`start` / `stop`) |
+| `phone_read_screen`, `phone_screenshot`, `phone_zoom`, `phone_find`, `phone_wait` | seeing and waiting; `phone_screenshot(marks=true)` numbers every element and `phone_tap(text="#12")` taps one |
 | `phone_storage_report` | free space, every app (app vs. data), and with `deep=true` a camera roll scan; ends with ways to get space back. No screen needed |
 | `phone_journal`, `phone_note` | read earlier sessions' notes and runs; save a note for later |
 | `device_info`, `device_apps` | model, iOS, battery; installed apps |
@@ -133,6 +136,36 @@ curl -s -X POST localhost:8780/api/do -H 'X-iPhone-Agent: 1' -H 'Content-Type: a
 report goes to `reports/storage/` and a row in `history.csv`; `phone_note`
 appends to `NOTES.md`. Typed text is never logged. `IPHONE_JOURNAL=0` turns it
 off, `IPHONE_JOURNAL_REPO=owner/name` points it elsewhere.
+
+### Speed
+
+Measured on an iPhone 14 (iOS 26.4) over Wi-Fi, WebDriverAgent engine:
+
+| | |
+|---|---|
+| tap | ~0.6 s |
+| read the screen (accessibility tree) | 0.3-0.5 s (WebDriverAgent's own visibility check would add ~5 s, so geometry is used instead) |
+| screenshot | free: a background thread keeps the newest frame of the phone's MJPEG stream |
+| after an action | wait until the stream's frames stop changing (0.12-1.2 s) instead of a fixed pause |
+| storage report | ~20 s apps + disk, ~45 s more for the camera roll (6 parallel AFC connections) |
+
+Where the time really goes is round trips between the agent and the phone, so
+the tools are built to need few: `phone_do` batches, `phone_keys`/`taps` resolve
+many taps from one read, `phone_dismiss` clears layered popups in one call,
+`phone_goto` and `phone_storage_report` are whole tasks. Ideas taken from
+[Maestro](https://github.com/mobile-dev-inc/maestro) (tap, then compare frames
+instead of waiting for idle), [AppAgent](https://github.com/TencentQQGYLab/AppAgent)
+(set-of-marks screenshots), [mobile-mcp](https://github.com/mobile-next/mobile-mcp)
+(batched commands), and WebDriverAgent's own settings (`shouldWaitForQuiescence`,
+`waitForIdleTimeout`, `animationCoolOffTimeout`, MJPEG frame rate and quality).
+Turning on Settings > Accessibility > Motion > Reduce Motion on the phone shortens
+every transition further.
+
+### Recipes
+
+`recipes/games.py` shows a task done the fast way: Wordle, a free Spelling Bee
+(spellbee.org) and NYT Connections in Chrome, one call per move, with word lists
+from [wordfreq](https://github.com/rspeer/wordfreq) (`pip install -e '.[games]'`).
 
 ### Why not a hosted (Vercel) viewer
 

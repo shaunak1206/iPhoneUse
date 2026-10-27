@@ -34,7 +34,11 @@ Be fast: plan the whole flow, then act in as few calls as possible.
 - Task tools first: phone_storage_report (no screen needed), phone_goto for
   Settings pages, phone_open_app / phone_open_url.
 - Known steps go in one phone_do call; only read the screen between calls when
-  the next step depends on what appears.
+  the next step depends on what appears. Wait with wait_for (a text), never a
+  fixed sleep.
+- An ad, popup, cookie banner or X in the way: phone_dismiss (or a "dismiss"
+  step) clears it in one call. On-screen keyboards in apps and games:
+  phone_keys("crane", "enter") taps the whole word from one read.
 - Every action returns the screen that followed. Don't call phone_read_screen
   right after an action, and take phone_screenshot only to see icons or images.
 
@@ -116,6 +120,18 @@ def build() -> FastMCP:
 
     @mcp.tool
     @tool_errors
+    async def phone_record(action: Literal["start", "stop", "status"], name: str | None = None) -> str:
+        """Record the phone's screen to an MP4 on the Mac (for demos and bug reports).
+        start (optional file name), then stop to save it; status says if recording.
+        Needs WebDriverAgent running."""
+        if action == "start":
+            return f"Recording to {await asyncio.to_thread(p.record_start, name)}. Call phone_record('stop') to save."
+        if action == "stop":
+            return f"Saved {await asyncio.to_thread(p.record_stop)}"
+        return f"Recording to {p.recording()}" if p.recording() else "Not recording."
+
+    @mcp.tool
+    @tool_errors
     async def phone_disconnect() -> str:
         """Stop WebDriverAgent when you are done with the phone. That clears the
         "Automation Running" banner and uploads this session's actions to the run
@@ -138,9 +154,14 @@ def build() -> FastMCP:
 
     @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_screenshot(include_text: bool = True) -> list:
+    async def phone_screenshot(include_text: bool = True, marks: bool = False) -> list:
         """Screenshot of the phone (1 image pixel = 1 phone point, so pixel coordinates
-        are tap coordinates), plus the text with tap points unless include_text is false."""
+        are tap coordinates), plus the text with tap points unless include_text is false.
+        marks=true draws a numbered box on every element and lists them; then
+        phone_tap(text="#12") taps box 12, which is the quickest way to hit icons."""
+        if marks:
+            jpg, legend = await p.marked()
+            return [Image(data=jpg, format="jpeg"), legend]
         s = await p.io(p.eng().capture, image=True, ocr=include_text)
         assert s.jpg is not None
         out: list = [Image(data=s.jpg, format="jpeg")]
@@ -279,6 +300,23 @@ def build() -> FastMCP:
 
     @mcp.tool
     @tool_errors
+    async def phone_dismiss() -> str:
+        """Clear whatever is in the way in one call: system prompts (the safe answer),
+        ads ("Continue to ...", "Skip", waits out "Skip in 5 s"), close buttons and
+        X's (labelled or drawn), cookie banners (Reject). Returns the screen after."""
+        return await p.after(await p.dismiss())
+
+    @mcp.tool
+    @tool_errors
+    async def phone_keys(keys: str, then: str | None = None) -> str:
+        """Type on a keyboard drawn by the app or web page (Wordle, keypads, games),
+        where phone_type cannot reach: keys="crane" taps c, r, a, n, e from one screen
+        read; then="enter" (or "backspace") presses a named key after."""
+        seq: list[str] = list(keys) + ([then] if then else [])
+        return await p.after(await p.keys(seq))
+
+    @mcp.tool
+    @tool_errors
     async def phone_wait(seconds: float = 1.0, for_text: str | None = None, timeout: float = 15) -> str:
         """Wait a fixed time, or until text appears (polling up to timeout seconds)."""
         if not for_text:
@@ -301,9 +339,11 @@ def build() -> FastMCP:
            {"tap": "Review Large Attachments"}]
 
         Actions: open_app, open_url, goto, tap (text or [x, y]; occurrence, exact,
-        double), long_press, type (submit), key (modifiers), go, scroll (amount),
-        swipe (distance), alert (button or 'dismiss'), find (scroll), wait_for
-        (timeout), wait (seconds). A step that needs the user's yes takes
+        double), taps ([labels or points] from one read), keys (on-screen keyboard:
+        "crane" or ["c", "enter"]), long_press, type (submit), key (modifiers), go,
+        scroll (amount), swipe (distance), alert (button or 'dismiss'), dismiss (true:
+        ads, popups, X's, cookie banners), find (scroll), wait_for (timeout), wait
+        (seconds; prefer wait_for). A step that needs the user's yes takes
         "confirm": true, under the same rule as phone_tap. Returns one line per
         step and the final screen."""
         return await p.do(steps)
