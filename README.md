@@ -5,7 +5,19 @@ or app) can see the phone's screen, tap, type, open apps and Settings pages,
 answer prompts, and report where the storage went. Nothing extra on the phone
 beyond Apple's own UI-testing runner.
 
-One core, four ways in:
+## Demo
+
+![Claude playing Wordle, Spelling Bee and Connections on the phone, 2x speed](docs/demo-2x.gif)
+
+Claude on a real iPhone 14, driving Safari through this repo: today's Wordle
+(BINGO in 5 guesses), the free Spelling Bee at spellbee.org (15 words, all
+accepted) and NYT Connections (all four groups, no mistakes). It was recorded
+from the phone's own live stream and is shown at 2x speed. The only cut is a
+minute of idle time on Wordle's results screen.
+[Full-quality MP4](docs/demo-2x.mp4). The steps are in
+[recipes/DEMO.md](recipes/DEMO.md).
+
+## Four ways in
 
 | | For | How |
 |---|---|---|
@@ -14,16 +26,65 @@ One core, four ways in:
 | **iPhone Live** | watching and other apps | `iphone live` opens http://127.0.0.1:8780: the phone's screen live, Connect/Stop, every agent action, storage reports; the same URL serves an HTTP API |
 | **Run journal** | future sessions | each session's actions, storage reports over time and notes, in a private GitHub repo |
 
+## How the setup works
+
 ```
-Claude ──MCP──▶ iphone_mcp (Python)
-                 ├─ WebDriverAgent ─HTTP :8100 (Wi-Fi)─▶ runner app on the phone (phone unlocked, in hand)
-                 │     accessibility tree · taps/gestures · launch by bundle id · alerts · URLs
-                 ├─ mirrorctl serve (Swift) ─▶ iPhone Mirroring window (phone locked, nearby)
-                 │     ScreenCaptureKit capture · Vision OCR · CGEvent mouse/keys · AX menus
-                 └─ pymobiledevice3 ─USB/Wi-Fi lockdown─▶ storage, apps, battery, model
+Claude (MCP) / iphone CLI / iPhone Live
+        │
+        ▼
+iphone_mcp  ── Phone: every action, the safety guard, the activity log
+   ├─ WebDriverAgent engine ── HTTP :8100 over Wi-Fi ──▶ runner app on the phone (unlocked)
+   │      accessibility tree · taps and drags · apps by bundle id · alerts · URLs
+   │      MJPEG :9100 ──▶ screenshots · "has the screen settled?" · iPhone Live · recordings
+   ├─ scripts/wda_start.sh ── xcodebuild over USB ──▶ keeps the runner's test session alive
+   ├─ iPhone Mirroring engine (mirrorctl, Swift) ──▶ the mirrored window, when the phone is locked
+   └─ pymobiledevice3 ── lockdown and AFC over USB ──▶ storage, apps, battery (no screen needed)
 ```
 
-## Two engines
+What happens from start to finish:
+
+1. **The runner on the phone.** [WebDriverAgent](https://github.com/appium/WebDriverAgent)
+   (pinned at v16.15.3 in `vendor/`) is an XCUITest bundle. Xcode builds it, signs it
+   with a free Apple ID (Personal Team), and installs it on the phone over USB. It is
+   not an app you open. It runs only while an `xcodebuild test-without-building`
+   process on the Mac holds a test session. Free signing lasts 7 days, and the start
+   script re-signs when under 2 days remain.
+2. **Connecting.** `iphone connect`, `phone_connect` or the Connect button in iPhone
+   Live runs `scripts/wda_start.sh` in the background (log in `build/wda.log`).
+   - iOS then turns on automation mode, which asks for **Face ID or the passcode on the
+     phone**. You approve it; if nobody does, it gives up after 60 s.
+   - The phone then shows "Automation Running". The runner serves HTTP on port 8100
+     and an MJPEG video stream on port 9100, and its address is saved to `build/wda.url`.
+3. **Seeing.** A read is one `GET /source`: the front app's accessibility tree as JSON.
+   - `wda.py` turns it into labelled items with tap points, such as
+     `(195,398) [button] Play`. It drops what is off screen or under another layer and
+     flags alerts. No screenshot or OCR is involved.
+   - A background thread keeps the newest frame of the MJPEG stream, so screenshots
+     cost nothing, and "wait until the screen settles" means comparing frames.
+4. **Acting.** Taps, drags, typing, launching apps by bundle id, opening URLs and
+   answering alerts are HTTP calls to the runner. It injects them through XCTest as
+   real touches, so it works in any app, including Settings and Safari. Every action
+   goes through `phone.Phone`, which applies the safety guard and records what
+   happened for iPhone Live and the journal.
+5. **The cable.** The test session runs over the USB link to Xcode's device services.
+   - On networks that block device discovery (Bonjour), like UT's campus Wi-Fi, the
+     runner can only start with the cable in, and unplugging ends it.
+   - The HTTP and video traffic go over Wi-Fi either way.
+   - On a network that allows discovery, Xcode can also reach a paired phone without
+     the cable; that has not been tested here.
+6. **Stopping.** `iphone stop` or `phone_disconnect` calls `GET /wda/shutdown`, which
+   ends the test session and clears "Automation Running". Killing xcodebuild instead
+   leaves the banner up. The start script also stops the runner after 120 s with no
+   calls (`IPHONE_WDA_IDLE`), and the session's actions go to the run journal.
+7. **When the phone is locked**, WebDriverAgent cannot act, so the same tools fall back
+   to iPhone Mirroring on the Mac: ScreenCaptureKit capture, Vision OCR, and mouse and
+   key events, through the `mirrorctl` helper.
+8. **Without the screen**, pymobiledevice3 talks to the phone's lockdown and file
+   services over USB for storage reports, the app list, battery and model.
+9. **Recording.** `iphone record start` / `stop` saves the MJPEG stream to
+   `build/recordings/*.mp4` with ffmpeg. The demo above is one of these.
+
+### The two engines side by side
 
 The tools are the same either way; `phone_status` says which one is driving.
 
@@ -33,66 +94,65 @@ The tools are the same either way; `phone_status` says which one is driving.
 | Reads the screen from | the accessibility tree (exact names, icon-only buttons, switch states) | OCR of the mirrored window |
 | Opens apps | by bundle id (instant), Spotlight for unknown names | Spotlight |
 | System alerts | WebDriverAgent's alert API | layout guess + tap |
-| Needs | Xcode, free Apple ID signing, Developer Mode, `scripts/wda_start.sh` running | nothing on the phone |
-
-WebDriverAgent ([appium/WebDriverAgent](https://github.com/appium/WebDriverAgent),
-pinned in `vendor/`) is a UI-test runner: it exists only while an `xcodebuild
-test-without-building` process on the Mac keeps it alive. `phone_connect`
-starts that in the background (`scripts/wda_start.sh`, log in `build/wda.log`,
-URL in `build/wda.url`). It outlives the MCP server, so later sessions reuse it.
-Free signing lasts 7 days; the start script re-signs when under 2 days remain.
-
-### WebDriverAgent setup (one time)
-
-```bash
-git clone --depth 1 --branch v16.15.3 https://github.com/appium/WebDriverAgent.git vendor/WebDriverAgent
-scripts/wda_start.sh --build   # signs with your Personal Team as com.shaunakkapur.WebDriverAgentRunner
-```
-
-Then plug the phone in once and call `phone_connect` (or run `scripts/wda_start.sh`).
-The first launch may ask you to trust the developer on the phone (Settings >
-General > VPN & Device Management). After the first cable start, the phone is
-reachable over the same Wi-Fi. `IPHONE_ENGINE=mirror|wda` forces an engine;
-`IPHONE_WDA_URL` points at a runner started some other way.
-
-## Why this design
-
-| Option | Verdict |
-|---|---|
-| **iPhone Mirroring + macOS automation** (chosen) | Built into macOS 15+/iOS 18+. No phone app, no Xcode, no developer account, works on every app including Settings. Costs: the phone must be locked and nearby while driven, and control is by pixels and OCR, not an element tree. |
-| WebDriverAgent / XCUITest (Appium, mobile-mcp) | Best fidelity (real accessibility tree, phone usable in hand). Needs full Xcode (~12 GB+; this Mac had 16 GB free), an Apple ID signing team (free certs expire every 7 days), and Developer Mode. Upgrade path if those become acceptable. |
-| Lockdown only (pymobiledevice3) | Device facts, app sizes, file access. No touch input; screenshots need Developer Mode + a root tunnel on iOS 17+. Used here as the read-only device layer. |
-| Bluetooth HID (ESP32 mouse + AssistiveTouch) | Blind without a video feed; hardware. |
-| Shortcuts / jailbreak | No general UI control / not acceptable. |
+| Needs | Xcode, free Apple ID signing, Developer Mode, Face ID at each start, the cable on campus Wi-Fi | nothing on the phone |
 
 ## Setup (one time)
 
-1. **iPhone Mirroring**: open it on the Mac, follow the prompt on the phone.
-   In iPhone Mirroring > Settings choose *Authenticate Automatically* so it
-   doesn't stop for Touch ID each session.
-2. **macOS permissions** for the app that runs the server (Claude Code shows as
-   `claude`): *Accessibility* (to click/type) and *Screen & System Audio
-   Recording* (to see the phone). System Settings > Privacy & Security.
-3. **Device layer (optional)**: plug the phone in by USB once, tap *Trust*.
-   Then Finder > iPhone > *Show this iPhone when on Wi-Fi* to drop the cable.
-4. Register with Claude Code:
+**WebDriverAgent** (the main engine):
+
+1. On the phone: Settings > Privacy & Security > Developer Mode, then restart.
+2. Build and sign the runner:
 
    ```bash
-   claude mcp add --scope user iphone /Users/shaunkapoor/iPhoneMCP/run.sh
+   git clone --depth 1 --branch v16.15.3 https://github.com/appium/WebDriverAgent.git vendor/WebDriverAgent
+   scripts/wda_start.sh --build   # signs with your Personal Team as com.shaunakkapur.WebDriverAgentRunner
    ```
+
+3. Plug the phone in, tap *Trust* on it, and run `iphone connect`. The first launch
+   may ask you to trust the developer on the phone (Settings > General > VPN & Device
+   Management). Approve the Face ID prompt when it appears.
+
+`IPHONE_ENGINE=mirror|wda` forces an engine; `IPHONE_WDA_URL` points at a runner
+started some other way.
+
+**iPhone Mirroring** (the fallback for a locked phone):
+
+1. Open iPhone Mirroring on the Mac and follow the prompt on the phone. In iPhone
+   Mirroring > Settings choose *Authenticate Automatically* so it doesn't stop for
+   Touch ID each session.
+2. Give the app that runs the server (Claude Code shows as `claude`) *Accessibility*
+   (to click and type) and *Screen & System Audio Recording* (to see the phone) in
+   System Settings > Privacy & Security.
+
+**Register with Claude Code:**
+
+```bash
+claude mcp add --scope user iphone /Users/shaunkapoor/iPhoneMCP/run.sh
+```
 
 `run.sh` uses `.venv` (`uv venv && uv pip install -r requirements.txt`). The
 Swift helper rebuilds itself from `bridge/mirrorctl.swift` when the source is
 newer than `bin/mirrorctl` (needs only the Command Line Tools).
 
+## Why this design
+
+| Option | Verdict |
+|---|---|
+| **WebDriverAgent / XCUITest** (chosen) | A real accessibility tree with exact labels, the phone usable in your hand, every app including Settings. Costs: full Xcode, a free signing profile that lasts 7 days, Developer Mode, Face ID at each start, and the cable on campus Wi-Fi. |
+| iPhone Mirroring + macOS automation (fallback) | Built into macOS 15+/iOS 18+, nothing on the phone, works while the phone is locked. Control is by pixels and OCR, and the phone has to stay locked and near the Mac. |
+| Lockdown only (pymobiledevice3) | Device facts, app sizes, file access. No touch input; screenshots need Developer Mode + a root tunnel on iOS 17+. Used here as the read-only device layer. |
+| Bluetooth HID (ESP32 mouse + AssistiveTouch) | Blind without a video feed; hardware. |
+| Shortcuts / jailbreak | No general UI control / not acceptable. |
+
 ## Using it
 
-Lock the phone and leave it near the Mac. Mirroring pauses whenever the phone is
-in your hand (`phone_status` says so); lock it again and call `phone_connect`.
+Plug the phone in, unlock it, and run `iphone connect` (approve Face ID on the
+phone); `iphone live` shows the screen. If the phone is locked, the tools use
+iPhone Mirroring instead: lock it, leave it near the Mac, and call `phone_connect`.
 
-Coordinates are **phone points** (iPhone 13: 390 x 844, origin top-left).
-Screenshots are scaled so one image pixel is one point, and every OCR'd text
-item comes with its tap point, so most steps don't need an image at all.
+Coordinates are **phone points** (iPhone 14: 390 x 844, origin top-left).
+Screenshots are scaled so one image pixel is one point, and every text item
+comes with its tap point, so most steps don't need an image at all.
 
 | Tool | What it does |
 |---|---|
@@ -165,7 +225,7 @@ every transition further.
 ### Recipes
 
 `recipes/games.py` shows a task done the fast way: Wordle, a free Spelling Bee
-(spellbee.org) and NYT Connections in Chrome, one call per move, with word lists
+(spellbee.org) and NYT Connections in Safari (`--chrome` for Chrome), one call per move, with word lists
 from [wordfreq](https://github.com/rspeer/wordfreq) (`pip install -e '.[games]'`).
 
 ### Why not a hosted (Vercel) viewer
@@ -203,7 +263,7 @@ for Pro Max models).
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_smoke.py   # offline: every tool via FastMCP against tests/fake_mirrorctl.py
+.venv/bin/python tests/test_smoke.py   # offline: every tool via FastMCP against tests/fake_wda.py and fake_mirrorctl.py
 .venv/bin/python tests/live_check.py   # live, read-only walk through Settings on the real phone
 ./run.sh --check                       # readiness report
 ```
