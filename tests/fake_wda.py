@@ -76,7 +76,14 @@ SCREENS = {
             node("StaticText", "Tabs not used for 21 days", (32, 150, 200, 18))]),
         node("Other", "", (0, 0, 390, 844), children=[
             node("StaticText", "Wordle", (150, 250, 90, 30)), node("StaticText", "Get 6 chances", (100, 300, 190, 20)),
-            node("Button", "Play", (150, 400, 90, 44))])])),
+            node("Button", "Play", (150, 400, 90, 44)), node("Button", "Address and search bar", (60, 55, 270, 30)),
+            node("Button", "Show tabs", (256, 768, 40, 40))])])),
+    # Safari: the bottom bar sits in a full-screen layer drawn after the page
+    "safari": app(node("Other", "", (0, 0, 390, 844), children=[
+        node("WebView", "", (0, 0, 390, 844), children=[
+            node("StaticText", "Wordle", (150, 250, 90, 30)), node("Button", "Play", (150, 400, 90, 44))]),
+        node("Other", "", (0, 0, 390, 844), children=[
+            node("Button", n, (34 + 90 * i, 762, 48, 48)) for i, n in enumerate(["Back", "Page Menu", "More"])])])),
     # the home screen: icons under an empty full-screen layer stay visible
     "home2": app(node("Other", "", (0, 0, 390, 844), children=[
         node("Other", "", (0, 0, 390, 844), children=[node("Icon", n, (20 + 90 * i, 110, 64, 80))

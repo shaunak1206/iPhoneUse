@@ -95,6 +95,23 @@ scrolls starting at the screen edge.
 - Free Apple ID signing: 7-day profiles (wda_start.sh re-signs under 48 h left), at
   most 3 sideloaded apps on the phone, 10 new App IDs per week.
 
+- Starting the runner turns on iOS automation mode, which asks for **Face ID or the
+  passcode on the phone** (LocalAuthenticationUIService) and gives up after 60 s with
+  "Timed out while enabling automation mode". The user approves it; never type a passcode.
+  An idle phone also auto-locks mid-session, and the engine then falls back to Mirroring.
+- Batched taps do not work on the real phone: two taps on one finger in one W3C actions
+  request register nothing, and one finger per tap drops every second finger whatever
+  the spacing (WDA compresses the pauses). A dummy tap on a blank spot in each even
+  slot makes it work (5 keys in 1.4 s vs 3.2 s one per request) but could hit something
+  on other screens, so `tap_many` sends one `/wda/tap` per point.
+- A screen read is ~1 s: `/source` 0.4 s plus `/alert/text` 0.55 s. WDA serializes
+  requests, so running them in parallel saves nothing.
+- Safari keeps its bottom toolbar in a full-screen layer drawn after the page, so a
+  covering layer must spread down at least 40% of the screen, not just have 3 items.
+- NYT pages stack layers with gaps (ad countdown, a promo, How to play, a late promo
+  once play starts, a stats modal over the board on a win): clear until a pass finds
+  nothing, and treat the stats modal as the end of the game.
+
 ## Adding a phone action
 
 1. Implement it on `Phone` (returns one line saying what happened; call `_did`).

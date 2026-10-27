@@ -2,7 +2,7 @@
 (spellbee.org) and Connections, in Chrome. Built on phone.Phone; an example of
 a recipe that turns a whole task into a few fast steps.
 
-    python -m recipes.games open wordle            # fresh incognito tab in Chrome
+    python -m recipes.games open wordle            # in Safari (--chrome / --incognito for Chrome)
     python -m recipes.games wordle-run             # all of it in one call, with timings (~40-50 s)
     python -m recipes.games wordle-start           # Play, then clear the ad and How-to-play layers
     python -m recipes.games wordle-solve           # play to the end: most common word that fits
@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -57,20 +58,32 @@ def words(n: int = 80000) -> list[str]:
 
 # -- Chrome ---------------------------------------------------------------
 
-async def open_in_chrome(p: Phone, url: str, incognito: bool = True) -> str:
-    """A fresh tab (incognito keeps puzzles unplayed and logged out) at url."""
+async def open_in_chrome(p: Phone, url: str, incognito: bool = False) -> str:
+    """A new Chrome tab at url (incognito=True for a logged-out one)."""
     await p.open_app("com.google.chrome.ios")
     await p.settle_screen()
-    if incognito:
+    s = await p.read()
+    if screen.find(s, "Show tabs"):
         await p.taps(["Show tabs"])
         await p.settle_screen()
-        await p.taps(["Incognito tabs"])
+    await p.taps(["Incognito tabs" if incognito else "Currently open tabs"])
+    await p.settle_screen()
+    s = await p.read()
+    if incognito and screen.find(s, "Continue in Incognito"):
+        # Chrome locks incognito tabs when it leaves the foreground; this asks for Face ID.
+        await p.taps(["Continue in Incognito"])
+        for _ in range(8):
+            await asyncio.sleep(0.5)
+            s = await p.read()
+            if not screen.find(s, "Continue in Incognito"):
+                break
+        else:
+            return await open_in_chrome(p, url)
+    new = (screen.find(s, "Create new Incognito tab") if incognito else None) or screen.find(s, "Create new tab") \
+        or screen.find(s, "New tab")
+    if new:
+        await p.tap(new[0].cx, new[0].cy)
         await p.settle_screen()
-        s = await p.read()
-        new = screen.find(s, "Create new tab") or screen.find(s, "New tab") or screen.find(s, "New Incognito Tab")
-        if new:
-            await p.tap(new[0].cx, new[0].cy)
-            await p.settle_screen()
     s = await p.read()
     bar = next((h for q in ("Search or type URL", "Search Google or type URL", "Address and search bar")
                 for h in screen.find(s, q)), None)
@@ -79,7 +92,24 @@ async def open_in_chrome(p: Phone, url: str, incognito: bool = True) -> str:
     await p.tap(bar.cx, bar.cy)
     await p.settle_screen()
     await p.type(url, submit=True)
-    return await p.after(f"Opened {url} in {'an incognito' if incognito else 'a'} Chrome tab.", settle=2.0)
+    return await p.after(f"Opened {url} in {'an incognito' if incognito else 'a new'} Chrome tab.", settle=2.0)
+
+
+async def open_in_safari(p: Phone, url: str) -> str:
+    """url in Safari's current tab (the bottom address bar)."""
+    await p.open_app("com.apple.mobilesafari")
+    await p.settle_screen()
+    await p.taps(["Address"])
+    await p.settle_screen()
+    await p.type(url, submit=True)
+    return await p.after(f"Opened {url} in Safari.", settle=2.0)
+
+
+async def open_page(p: Phone, url: str, args: list[str] = ()) -> str:
+    """Safari by default; --chrome (and --incognito) for Chrome."""
+    if "--chrome" in args or "--incognito" in args:
+        return await open_in_chrome(p, url, incognito="--incognito" in args)
+    return await open_in_safari(p, url)
 
 
 # -- Wordle ---------------------------------------------------------------
@@ -94,20 +124,47 @@ def board(s) -> list[str]:
 
 
 async def wordle_guess(p: Phone, word: str) -> list[str]:
-    await p.keys(["backspace"] * 5 + list(word.lower()) + ["enter"])
+    for attempt in range(3):
+        s = await p.read()
+        before = board(s)
+        typed = sum(1 for it in s.items if (m := TILE.fullmatch(it.text)) and not m.group(3))  # not yet sent
+        try:
+            await p.keys(["backspace"] * typed + list(word.lower()) + ["enter"])
+            break
+        except ValueError as e:  # a late promo over the keyboard
+            if "no on-screen key" not in str(e) or attempt == 2:
+                raise
+            await p.dismiss(rounds=3, wait_ads=10)
     await asyncio.sleep(1.4)  # five tiles flip one after another
     await p.settle_screen()
-    return board(await p.read())
+    s = await p.read()
+    rows = board(s)
+    if len(rows) <= len(before) and (screen.find(s, "Congratulations") or screen.find(s, "GUESS DISTRIBUTION")):
+        return before + [" ".join(c.upper() + "G" for c in word)]  # the win's stats modal covers the board
+    return rows
 
 
 async def wordle_start(p: Phone) -> str:
-    """From the Wordle start page: Play, then clear the ad and How-to-play layers."""
+    """From the Wordle start page: Play (or Continue, for a game already started in
+    this browser), then clear the ad and How-to-play layers."""
     s = await p.read()
-    if screen.find(s, "Play", exact=True):
-        await p.tap(text="Play", exact=True)
-        await p.settle_screen()
-    await p.dismiss(rounds=4, wait_ads=15)
-    return await p.wait_for("enter", 15)
+    for label in ("Play", "Continue"):
+        if screen.find(s, label, exact=True):
+            await p.tap(text=label, exact=True)
+            await p.settle_screen()
+            break
+    # The ad, a promo and How to play arrive one after another with gaps, so keep
+    # clearing until a pass finds nothing and the keyboard is showing.
+    end = time.time() + 45
+    while True:
+        cleared = await p.dismiss(rounds=4, wait_ads=15)
+        s = await p.read()
+        if cleared == "Nothing to dismiss." and screen.find(s, "enter", exact=True):
+            return "Wordle is ready (keyboard showing)."
+        if time.time() > end:
+            raise ValueError("Wordle's keyboard did not come up within 45s.\n\n" + screen.describe(s))
+        if cleared == "Nothing to dismiss.":
+            await asyncio.sleep(0.5)
 
 
 def fits(word: str, rows: list[str]) -> bool:
@@ -167,9 +224,9 @@ async def wordle_solve(p: Phone, first: str = "crane", guess=None) -> list[str]:
     guess = guess or (lambda w: wordle_guess(p, w))
     rows = board(await p.read()) if p else []
     tried: set[str] = set()
-    while len(rows) < 6 and not solved(rows):
+    while len(rows) < 6 and not solved(rows) and len(tried) < 10:
         cands = [w for w in wordle_candidates(rows, 300) if w not in tried]
-        if not rows:
+        if not rows and first not in tried:
             word = first
         elif not cands:
             break
@@ -255,19 +312,19 @@ async def main(argv: list[str]) -> str:
     if cmd not in ("help", "-h", "--help") and not await asyncio.to_thread(p.wda.ready):
         print((await p.connect("wda", 60)).splitlines()[0], file=sys.stderr)  # the runner idled out: restart it
     if cmd == "open":
-        return await open_in_chrome(p, URLS.get(args[0], args[0]), incognito="--normal" not in args)
+        return await open_page(p, URLS.get(args[0], args[0]), args)
     if cmd == "wordle":
         rows = await wordle_guess(p, args[0])
         return "\n".join(rows) + "\n\nfits: " + ", ".join(wordle_candidates(rows, 12))
     if cmd == "wordle-run":
-        import time
         t0 = time.time()
         marks = []
-        await open_in_chrome(p, URLS["wordle"])
+        await open_page(p, URLS["wordle"], args)
         marks.append(("open", time.time() - t0))
         await wordle_start(p)
         marks.append(("start (Play, ad, How to play)", time.time() - t0 - sum(m[1] for m in marks)))
-        rows = await wordle_solve(p, args[0] if args else "crane")
+        first = [a for a in args if not a.startswith("--")]
+        rows = await wordle_solve(p, first[0] if first else "crane")
         marks.append((f"solve ({len(rows)} guesses)", time.time() - t0 - sum(m[1] for m in marks)))
         times = "\n".join(f"  {label:32s} {sec:5.1f}s" for label, sec in marks)
         return ("\n".join(rows) + ("\n\nsolved" if solved(rows) else "\n\nnot solved")

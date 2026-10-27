@@ -408,6 +408,11 @@ class Wda:
             r = n.get("rect") or {}
             return float(r.get("width") or 0) * float(r.get("height") or 0) >= 0.9 * w * h
 
+        def covers(part: list[TextItem]) -> bool:
+            # Things spread down the screen, not a toolbar strip (Safari keeps its
+            # bottom bar in a full-screen layer drawn after the page).
+            return len(part) >= 3 and max(i.y + i.h for i in part) - min(i.y for i in part) >= 0.4 * h
+
         def walk(n: dict, alert: list | None) -> list[TextItem]:
             t = n.get("type") or ""
             if t in SKIP:
@@ -422,7 +427,7 @@ class Wda:
             # full-screen layer that shows things is covered (Chrome keeps its tab
             # grid under the page). WebDriverAgent's own visibility check would
             # catch this but costs seconds per read.
-            top = max((i for i, k in enumerate(kids) if full(k) and len(parts[i]) >= 3), default=-1)
+            top = max((i for i, k in enumerate(kids) if full(k) and covers(parts[i])), default=-1)
             got = [it for i, part in enumerate(parts) if not (full(kids[i]) and i < top) for it in part]
             if t not in SHOWN or (t in ("Cell", "Image", "Icon") and got and t != "Icon"):
                 return got
@@ -513,17 +518,12 @@ class Wda:
             self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
         self._done()
 
-    def tap_many(self, points: list[tuple[float, float]], hold_ms: int = 40, gap_ms: int = 90) -> None:
-        """Several taps in one W3C actions request: one round trip for a whole word on
-        a page keyboard instead of ~0.6 s per tap."""
-        acts: list[dict] = []
+    def tap_many(self, points: list[tuple[float, float]]) -> None:
+        """Several taps in a row, one request each (~0.6 s per tap). Batching them in
+        one W3C actions request does not work on a real phone (iOS 26.4): two taps on
+        one finger register nothing, and one finger per tap drops every second tap."""
         for x, y in points:
-            acts += [{"type": "pointerMove", "duration": 0, "x": round(x), "y": round(y)},
-                     {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": hold_ms},
-                     {"type": "pointerUp", "button": 0}, {"type": "pause", "duration": gap_ms}]
-        self._req("POST", "/actions", {"actions": [{"type": "pointer", "id": "finger1",
-                                                    "parameters": {"pointerType": "touch"}, "actions": acts}]},
-                  session=True, timeout=60 + len(points))
+            self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
         self._done()
 
     def drag(self, x1: float, y1: float, x2: float, y2: float, *, ms: float = 300, hold_ms: float = 30) -> None:

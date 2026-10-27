@@ -423,6 +423,9 @@ async def wda_tests() -> None:
             r = text(await c.call_tool("phone_read_screen", {}))
             check("Inactive tabs" not in r and "Tabs not used" not in r and "Play" in r,
                   "a full-screen layer under the page (Chrome's tab grid) is left out", r)
+            fake.screen = "safari"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("Play" in r and "More" in r, "a toolbar strip in a later full-screen layer hides nothing (Safari)", r)
             fake.screen = "home2"
             r = text(await c.call_tool("phone_read_screen", {}))
             check("[app] Weather" in r and "[app] Home" in r, "an empty layer on top hides nothing", r)
@@ -446,10 +449,11 @@ async def wda_tests() -> None:
                   "keys and taps steps in a batch", (fake.pressed, r[:200]))
             check(len(fake.called("/source")) - reads <= 3, "each batch of taps costs one screen read",
                   len(fake.called("/source")) - reads)
-            n_actions = len(fake.called("/actions"))
+            fake.pressed = []
             await c.call_tool("phone_keys", {"keys": "crane", "then": "enter"})
-            check(len(fake.called("/actions")) - n_actions == 1, "a whole word goes in one touch request",
-                  len(fake.called("/actions")) - n_actions)
+            check([k.split()[-1] if k.startswith("add") else k.split()[0] for k in fake.pressed]
+                  == ["c", "r", "a", "n", "e", "enter"],
+                  "every key of a word lands, in order", fake.pressed)
             r = text(await c.call_tool("phone_keys", {"keys": "7"}))
             check("no on-screen key for '7'" in r, "missing key explained", r[:80])
 

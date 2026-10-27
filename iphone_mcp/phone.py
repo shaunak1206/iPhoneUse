@@ -533,7 +533,7 @@ class Phone:
         return self._did("Tapped " + ", ".join(f"'{lbl}'" for _, _, lbl in points) + ".")
 
     async def _tap_points(self, points: list[tuple[float, float]]) -> None:
-        """Tap in order; under WebDriverAgent all in one request."""
+        """Tap in order, without a screen read between taps."""
         e = self.eng()
         if isinstance(e, Wda) and len(points) > 1:
             await self.io(e.tap_many, points)

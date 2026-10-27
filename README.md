@@ -144,7 +144,8 @@ Measured on an iPhone 14 (iOS 26.4) over Wi-Fi, WebDriverAgent engine:
 | | |
 |---|---|
 | tap | ~0.6 s |
-| read the screen (accessibility tree) | 0.3-0.5 s (WebDriverAgent's own visibility check would add ~5 s, so geometry is used instead) |
+| read the screen | ~1 s: the accessibility tree 0.3-0.5 s plus a SpringBoard alert check ~0.55 s (WebDriverAgent's own visibility check would add ~5 s, so geometry is used instead) |
+| a word on a page keyboard (Wordle) | ~0.6 s per key: one request per tap, because batching taps in one touch request does not register on a real phone |
 | screenshot | free: a background thread keeps the newest frame of the phone's MJPEG stream |
 | after an action | wait until the stream's frames stop changing (0.12-1.2 s) instead of a fixed pause |
 | storage report | ~20 s apps + disk, ~45 s more for the camera roll (6 parallel AFC connections) |

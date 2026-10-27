@@ -85,7 +85,7 @@ the whole task, then:
 - **Show the user:** `phone_watch`, then act; they watch live. To keep a video:
   `phone_record("start")` ... `phone_record("stop")` (MP4 under `~/iPhoneMCP/build/recordings`).
 - **Web games and pages in Chrome:** see `~/iPhoneMCP/recipes/games.py` (Wordle,
-  spellbee.org, Connections): fresh incognito tab, one call per move.
+  spellbee.org, Connections): Safari by default, one call per move.
 
 ## Remember things
 
