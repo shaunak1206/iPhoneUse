@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from iphone_mcp import screen  # noqa: E402
-from iphone_mcp.phone import Phone  # noqa: E402
+from iphone_mcp.phone import Phone, _key_pattern  # noqa: E402
 
 URLS = {
     "wordle": "nytimes.com/games/wordle/index.html",
@@ -123,13 +123,46 @@ def board(s) -> list[str]:
     return [" ".join(c for _, c in sorted(r)) for _, r in sorted(rows.items())]
 
 
+def unsent(s) -> str:
+    """Letters typed into the current row but not sent yet."""
+    return "".join(m.group(2) for it in sorted(s.items, key=lambda i: (round(i.cy / 10), i.cx))
+                   if (m := TILE.fullmatch(it.text)) and not m.group(3))
+
+
+def blank_strip(s) -> tuple[float, float] | None:
+    """A point in the empty strip between the board and the keyboard, where a stray
+    tap does nothing: the filler for fast typing (Phone.keys)."""
+    tiles = [it for it in s.items if re.fullmatch(r"\d(?:st|nd|rd|th) letter, .+", it.text)]
+    keys = [it for it in s.items if any(_key_pattern(c).fullmatch(it.text.strip()) for c in "qwertyuiop")]
+    if not tiles or not keys:
+        return None
+    lo, hi = max(t.y + t.h for t in tiles), min(k.y for k in keys)
+    x, y = s.width / 2, (lo + hi) / 2
+    if hi - lo < 16 or screen.at(s, x, y):
+        return None
+    return x, y
+
+
+async def wordle_type(p: Phone, s, word: str) -> None:
+    """Clear unsent letters, type the word and press enter. The letters go in one fast
+    request through the blank strip; if the row does not read back as the word, it is
+    cleared and typed one tap per key."""
+    typed, filler = unsent(s), blank_strip(s)
+    if filler:
+        await p.keys(["backspace"] * len(typed) + list(word), filler=filler)
+        typed = unsent(await p.read(alerts=False))
+        if typed == word.upper():
+            await p.keys(["enter"])
+            return
+    await p.keys(["backspace"] * len(typed) + list(word) + ["enter"])
+
+
 async def wordle_guess(p: Phone, word: str) -> list[str]:
     for attempt in range(3):
-        s = await p.read()
+        s = await p.read(alerts=False)
         before = board(s)
-        typed = sum(1 for it in s.items if (m := TILE.fullmatch(it.text)) and not m.group(3))  # not yet sent
         try:
-            await p.keys(["backspace"] * typed + list(word.lower()) + ["enter"])
+            await wordle_type(p, s, word.lower())
             break
         except ValueError as e:  # a late promo over the keyboard
             if "no on-screen key" not in str(e) or attempt == 2:
@@ -137,7 +170,7 @@ async def wordle_guess(p: Phone, word: str) -> list[str]:
             await p.dismiss(rounds=3, wait_ads=10)
     await asyncio.sleep(1.4)  # five tiles flip one after another
     await p.settle_screen()
-    s = await p.read()
+    s = await p.read(alerts=False)
     rows = board(s)
     if len(rows) <= len(before) and (screen.find(s, "Congratulations") or screen.find(s, "GUESS DISTRIBUTION")):
         return before + [" ".join(c.upper() + "G" for c in word)]  # the win's stats modal covers the board

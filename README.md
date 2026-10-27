@@ -56,6 +56,8 @@ What happens from start to finish:
    - The phone then shows "Automation Running". The runner serves HTTP on port 8100
      and an MJPEG video stream on port 9100, and its address is saved to `build/wda.url`.
 3. **Seeing.** A read is one `GET /source`: the front app's accessibility tree as JSON.
+   If a big part of the screen has no labels but has something drawn in it (a game,
+   a photo, a video), that part is OCR'd and the readout says to look at a screenshot.
    - `wda.py` turns it into labelled items with tap points, such as
      `(195,398) [button] Play`. It drops what is off screen or under another layer and
      flags alerts. No screenshot or OCR is involved.
@@ -169,6 +171,7 @@ comes with its tap point, so most steps don't need an image at all.
 | `phone_dismiss` | clear whatever is in the way in one call: ads (waits out "Skip in 5 s"), popups, X's (labelled or drawn), cookie banners (always Reject) |
 | `phone_keys` | type on a keyboard drawn by an app or page (Wordle, keypads): `"crane"` + `then="enter"`, one read then back-to-back taps |
 | `phone_record` | record the live screen to an MP4 (`start` / `stop`) |
+| `phone_observe` | how actions report the next screen: `text` (labels with tap points), `image` (a screenshot, returned without waiting for labels), or `both` |
 | `phone_read_screen`, `phone_screenshot`, `phone_zoom`, `phone_find`, `phone_wait` | seeing and waiting; `phone_screenshot(marks=true)` numbers every element and `phone_tap(text="#12")` taps one |
 | `phone_storage_report` | free space, every app (app vs. data), and with `deep=true` a camera roll scan; ends with ways to get space back. No screen needed |
 | `phone_journal`, `phone_note` | read earlier sessions' notes and runs; save a note for later |
@@ -204,8 +207,9 @@ Measured on an iPhone 14 (iOS 26.4) over Wi-Fi, WebDriverAgent engine:
 | | |
 |---|---|
 | tap | ~0.6 s |
-| read the screen | ~1 s: the accessibility tree 0.3-0.5 s plus a SpringBoard alert check ~0.55 s (WebDriverAgent's own visibility check would add ~5 s, so geometry is used instead) |
-| a word on a page keyboard (Wordle) | ~0.6 s per key: one request per tap, because batching taps in one touch request does not register on a real phone |
+| read the screen | ~0.4 s: the accessibility tree. The SpringBoard alert check (~0.55 s) runs in the background while the agent thinks, and the next tap waits for its answer. WebDriverAgent's own visibility check would add ~5 s, so geometry is used instead |
+| reads per tap | one: a read stays good until the live picture changes, so a tap after the agent stops to think does not read again |
+| a word on a page keyboard (Wordle) | ~0.6 s per key one request at a time. Batching taps does not register on a real phone (it drops every second finger), so recipes that know a blank spot put a filler tap there in every second slot: 5 keys in ~1.4 s, checked afterwards |
 | screenshot | free: a background thread keeps the newest frame of the phone's MJPEG stream |
 | after an action | wait until the stream's frames stop changing (0.12-1.2 s) instead of a fixed pause |
 | storage report | ~20 s apps + disk, ~45 s more for the camera roll (6 parallel AFC connections) |

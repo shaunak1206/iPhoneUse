@@ -105,7 +105,17 @@ scrolls starting at the screen edge.
   slot makes it work (5 keys in 1.4 s vs 3.2 s one per request) but could hit something
   on other screens, so `tap_many` sends one `/wda/tap` per point.
 - A screen read is ~1 s: `/source` 0.4 s plus `/alert/text` 0.55 s. WDA serializes
-  requests, so running them in parallel saves nothing.
+  requests, so running them in parallel saves nothing. Instead, in the MCP server
+  (`Phone.background`), an action's readout skips the alert check and runs it as a
+  background task; `Phone._caught_up` makes the next tap wait for it and refuse if
+  it found a system alert the agent was not shown.
+- A read stays valid until the MJPEG picture changes (`Wda.unchanged_since`; WDA
+  sends identical bytes for an unchanged screen), so `Phone.fresh` reuses it however
+  old it is. Without a live stream it falls back to 1.5 s. Every Wda action calls
+  `_done()` to clear the cached read; a new action must too.
+- Background tasks belong to one event loop. Tests run several `asyncio.run`s over
+  one Phone, so `Phone._ours` ignores tasks from a loop that has closed (they never
+  finish), and `Phone.idle()` waits only for live ones.
 - Safari keeps its bottom toolbar in a full-screen layer drawn after the page, so a
   covering layer must spread down at least 40% of the screen, not just have 3 items.
 - NYT pages stack layers with gaps (ad countdown, a promo, How to play, a late promo

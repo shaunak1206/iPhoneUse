@@ -61,6 +61,11 @@ the whole task, then:
    element; then `phone_tap(text="#12")`.
 7. `phone_scroll` moves exactly the amount asked (no fling); `phone_find(text,
    scroll=true)` scrolls until something shows up.
+8. **Games, maps, photos, video:** a readout NOTE saying an area "has no labels but
+   shows something" means look with `phone_screenshot`. For a whole task in such an
+   app, `phone_observe("image")` makes every action return a screenshot (tap by x, y).
+9. A tap that comes back "A system prompt came up after the last action" means a
+   permission alert appeared: answer it with `phone_alert`, then carry on.
 
 ## Prompts and safety
 

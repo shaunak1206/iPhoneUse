@@ -41,6 +41,12 @@ Be fast: plan the whole flow, then act in as few calls as possible.
   phone_keys("crane", "enter") taps the whole word from one read.
 - Every action returns the screen that followed. Don't call phone_read_screen
   right after an action, and take phone_screenshot only to see icons or images.
+  A readout NOTE saying an area "has no labels but shows something" means part
+  of the screen is a picture, video or drawn game: look with phone_screenshot.
+  For a whole task in such an app, phone_observe("image") makes every action
+  return a screenshot instead.
+- A tap may come back "A system prompt came up after the last action": a
+  permission alert appeared. Answer it with phone_alert, then carry on.
 
 Coordinates are phone points (origin top-left; 390 x 844 on an iPhone 14).
 Every text item is tagged with its tap point; prefer phone_tap(text=...).
@@ -96,6 +102,19 @@ def tool_errors(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[An
 def build() -> FastMCP:
     mcp = FastMCP(name="iphone", instructions=INSTRUCTIONS)
     p = phone
+    p.background = True  # one long-lived process: alert checks and label reads can run between calls
+
+    async def shown(line: str, settle: float | None = None) -> Any:
+        """The action's line and the screen that followed, as phone_observe asks:
+        labels with tap points (text), a picture (image), or both."""
+        if p.observe == "image":
+            text, jpg = await p.after_image(line, settle)
+            return [text, Image(data=jpg, format="jpeg")]
+        readout = await p.after(line, settle)
+        if p.observe == "both":
+            s = await p.io(p.eng().capture, image=True, ocr=False)
+            return [readout, Image(data=s.jpg, format="jpeg")] if s.jpg else readout
+        return readout
 
     # -- connection --------------------------------------------------------
 
@@ -150,6 +169,21 @@ def build() -> FastMCP:
         url = await p.watch(open_on_mac)
         return f"iPhone Live is {'open' if open_on_mac else 'running'} at {url}."
 
+    @mcp.tool
+    @tool_errors
+    async def phone_observe(mode: Literal["text", "image", "both"]) -> str:
+        """How every action reports the screen that followed, for the rest of the session.
+
+        text (default): labels with tap points, about 0.4 s; best for apps, Settings
+        and forms. image: a screenshot instead, free from the live stream and
+        returned without waiting for labels; best for games, maps, photos and
+        anything drawn without labels (tap by x, y: 1 pixel = 1 point). both: the two.
+        The safety check on taps reads the labels either way."""
+        p.observe = mode
+        return {"text": "Actions now return the screen as labels with tap points.",
+                "image": "Actions now return a screenshot of the screen that followed.",
+                "both": "Actions now return labels with tap points and a screenshot."}[mode]
+
     # -- seeing ------------------------------------------------------------
 
     @mcp.tool(output_schema=None)
@@ -197,11 +231,11 @@ def build() -> FastMCP:
 
     # -- acting ------------------------------------------------------------
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
     async def phone_tap(x: float | None = None, y: float | None = None, text: str | None = None,
                         occurrence: int = 1, exact: bool = False, double: bool = False,
-                        confirm: bool = False) -> str:
+                        confirm: bool = False) -> Any:
         """Tap at (x, y) phone points, or on visible text (text=..., the Nth match top to
         bottom with occurrence=N). Returns the screen afterwards.
 
@@ -209,81 +243,81 @@ def build() -> FastMCP:
         grant access or confirm a destructive question, are refused unless
         confirm=True, which you may only pass after the user said yes in chat
         (or their request asked for exactly that)."""
-        return await p.after(await p.tap(x, y, text, occurrence, exact, double, confirm))
+        return await shown(await p.tap(x, y, text, occurrence, exact, double, confirm))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
     async def phone_long_press(x: float | None = None, y: float | None = None, text: str | None = None,
-                               seconds: float = 1.0, occurrence: int = 1, confirm: bool = False) -> str:
+                               seconds: float = 1.0, occurrence: int = 1, confirm: bool = False) -> Any:
         """Press and hold (context menus, home-screen edit mode, drag handles)."""
-        return await p.after(await p.long_press(x, y, text, seconds, occurrence, confirm))
+        return await shown(await p.long_press(x, y, text, seconds, occurrence, confirm))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
     async def phone_swipe(direction: Literal["up", "down", "left", "right"] | None = None,
                           x: float | None = None, y: float | None = None,
                           to_x: float | None = None, to_y: float | None = None,
-                          distance: float = 0.5, duration_ms: int = 300) -> str:
+                          distance: float = 0.5, duration_ms: int = 300) -> Any:
         """Drag a finger across the screen. direction is the way the finger moves
         (swipe 'left' pages a carousel forward). Starts at the screen center
         unless x/y given; distance is a fraction of the screen. Or give an exact
         path with x, y, to_x, to_y."""
-        return await p.after(await p.swipe(direction, x, y, to_x, to_y, distance, duration_ms))
+        return await shown(await p.swipe(direction, x, y, to_x, to_y, distance, duration_ms))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
     async def phone_scroll(direction: Literal["down", "up", "left", "right"] = "down", amount: float = 0.5,
-                           x: float | None = None, y: float | None = None) -> str:
+                           x: float | None = None, y: float | None = None) -> Any:
         """Scroll content exactly (no fling). 'down' reveals what is below. amount is a
         fraction of the screen height (0.5 = half a screen). x/y pick which
         scrollable area, default the center."""
-        return await p.after(await p.scroll(direction, amount, x, y))
+        return await shown(await p.scroll(direction, amount, x, y))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_type(text: str, submit: bool = False) -> str:
+    async def phone_type(text: str, submit: bool = False) -> Any:
         """Type into the focused field (tap the field first). submit=true presses Return.
         Never use this for passcodes or passwords."""
-        return await p.after(await p.type(text, submit))
+        return await shown(await p.type(text, submit))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_key(key: str, modifiers: str = "") -> str:
+    async def phone_key(key: str, modifiers: str = "") -> Any:
         """Press a key: return, delete, escape, tab, space, or one character.
         Modifiers (cmd, shift) and arrows need iPhone Mirroring."""
-        return await p.after(await p.key(key, modifiers))
+        return await shown(await p.key(key, modifiers))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_go(where: Literal["home", "app_switcher", "spotlight", "back"]) -> str:
+    async def phone_go(where: Literal["home", "app_switcher", "spotlight", "back"]) -> Any:
         """System navigation: home screen, app switcher, Spotlight search, or 'back'
         (left-edge swipe, the iOS back gesture)."""
-        return await p.after(await p.go(where))
+        return await shown(await p.go(where))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_open_app(name: str) -> str:
+    async def phone_open_app(name: str) -> Any:
         """Open an app by name or bundle id (instant under WebDriverAgent; Spotlight
         otherwise). Returns the app's first screen."""
-        return await p.after(await p.open_app(name), settle=0)
+        return await shown(await p.open_app(name), settle=0)
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_open_url(url: str) -> str:
+    async def phone_open_url(url: str) -> Any:
         """Open a web page or an app deep link (e.g. 'maps.apple.com/?q=coffee',
         'spotify:search:jazz'). Links that hand off to an app may show an
         'Open in ...?' prompt: answer it with phone_alert(button='Open')."""
-        return await p.after(await p.open_url(url), settle=0)
+        return await shown(await p.open_url(url), settle=0)
 
-    @mcp.tool(description="Jump straight to a Settings page in one call instead of tapping through. "
+    @mcp.tool(output_schema=None, description="Jump straight to a Settings page in one call instead of tapping through. "
                           "Places: " + ", ".join(sorted(SETTINGS)) + ".")
     @tool_errors
-    async def phone_goto(place: str) -> str:
-        return await p.after(await p.goto(place))
+    async def phone_goto(place: str) -> Any:
+        return await shown(await p.goto(place))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_alert(button: str | None = None, confirm: bool = False) -> str:
+    async def phone_alert(button: str | None = None, confirm: bool = False) -> Any:
         """Read or answer the alert, permission prompt or confirmation sheet on screen.
 
         No button: describe the prompt (question and buttons). button='Allow Once',
@@ -296,24 +330,24 @@ def build() -> FastMCP:
             pr = screen.prompt(s)
             return pr.describe() if pr else ("No alert, permission prompt or confirmation sheet detected.\n\n"
                                              + screen.describe(s))
-        return await p.after(await p.alert(button, confirm))
+        return await shown(await p.alert(button, confirm))
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_dismiss() -> str:
+    async def phone_dismiss() -> Any:
         """Clear whatever is in the way in one call: system prompts (the safe answer),
         ads ("Continue to ...", "Skip", waits out "Skip in 5 s"), close buttons and
         X's (labelled or drawn), cookie banners (Reject). Returns the screen after."""
-        return await p.after(await p.dismiss())
+        return await shown(await p.dismiss())
 
-    @mcp.tool
+    @mcp.tool(output_schema=None)
     @tool_errors
-    async def phone_keys(keys: str, then: str | None = None) -> str:
+    async def phone_keys(keys: str, then: str | None = None) -> Any:
         """Type on a keyboard drawn by the app or web page (Wordle, keypads, games),
         where phone_type cannot reach: keys="crane" taps c, r, a, n, e from one screen
         read; then="enter" (or "backspace") presses a named key after."""
         seq: list[str] = list(keys) + ([then] if then else [])
-        return await p.after(await p.keys(seq))
+        return await shown(await p.keys(seq))
 
     @mcp.tool
     @tool_errors

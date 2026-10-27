@@ -70,6 +70,7 @@ def describe(screen: Screen, limit: int = 120) -> str:
         if n >= limit:
             out.append(f"  ... {len(screen.items) - n} more items")
             break
+    out += [f"NOTE: {n}" for n in screen.notes]
     if any(SECRET_PROMPT.search(it.text) or it.kind == "SecureTextField" for it in screen.items):
         out.append("NOTE: this screen asks for a passcode or password. Only the user may enter it.")
     if (p := prompt(screen)):
@@ -77,10 +78,11 @@ def describe(screen: Screen, limit: int = 120) -> str:
     return "\n".join(out)
 
 
-# Element types worth naming in a readout; plain text and OCR stay untagged.
+# Element types worth naming in a readout; plain text stays untagged.
 TAGGED = {"Button": "button", "Link": "link", "Switch": "switch", "Toggle": "switch", "TextField": "field",
           "SearchField": "search field", "TextView": "field", "SecureTextField": "field", "Icon": "app",
-          "Cell": "row", "Tab": "tab", "Slider": "slider", "Image": "image", "MenuItem": "menu item"}
+          "Cell": "row", "Tab": "tab", "Slider": "slider", "Image": "image", "MenuItem": "menu item",
+          "ocr": "read from pixels"}
 
 
 def _tag(it: TextItem) -> str:

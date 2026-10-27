@@ -5,6 +5,7 @@ tests/fake_mirrorctl.py. No phone, no permissions needed.
 """
 
 import asyncio
+import io
 import json
 import os
 import sys
@@ -392,6 +393,7 @@ async def wda_tests() -> None:
             check("unknown place" in r and "storage" in r, "unknown place lists the known ones", r)
 
             print("dashboard")
+            await server.phone.idle()  # the dashboard test drives the same Phone from another event loop
             import warnings
             warnings.filterwarnings("ignore", message=".*httpx.*starlette.testclient.*")
             from starlette.testclient import TestClient
@@ -456,6 +458,82 @@ async def wda_tests() -> None:
                   "every key of a word lands, in order", fake.pressed)
             r = text(await c.call_tool("phone_keys", {"keys": "7"}))
             check("no on-screen key for '7'" in r, "missing key explained", r[:80])
+            fake.pressed, n_actions = [], len(fake.called("/actions"))
+            await server.phone.keys(list("crane") + ["enter"], filler=(195, 20))
+            check([k.split()[-1] if k.startswith("add") else k.split()[0] for k in fake.pressed]
+                  == ["c", "r", "a", "n", "e", "enter"] and len(fake.called("/actions")) - n_actions == 2,
+                  "filler taps: five keys per request, the dropped fingers are the fillers",
+                  (fake.pressed, len(fake.called("/actions")) - n_actions))
+
+            print("background alert check, reads that stay good, observe modes, unlabeled areas")
+            fake.screen, fake.sysalert = "springboard", None
+            await c.call_tool("phone_read_screen", {})
+            fake.sysalert = {"text": "\u201cPhotos\u201d Would Like to Send You Notifications",
+                             "buttons": ["Don\u2019t Allow", "Allow"], "then": "springboard"}
+            r = text(await c.call_tool("phone_go", {"where": "home"}))
+            check("PROMPT" not in r and "[app] Photos" in r, "an action's readout does not wait for the alert check", r)
+            taps = len(fake.called("/wda/tap"))
+            r = text(await c.call_tool("phone_tap", {"text": "Photos"}))
+            check(r.startswith("A system prompt came up") and "Allow" in r and len(fake.called("/wda/tap")) == taps,
+                  "the next tap waits for the check and stops at a surprise alert", r)
+            r = text(await c.call_tool("phone_alert", {"button": "dismiss"}))
+            check(fake.sysalert is None and "Don\u2019t Allow" in r, "then the alert is answered as usual", r)
+
+            w = server.phone.wda
+            w.frames()
+            for _ in range(60):
+                if w._frames.fresh():
+                    break
+                await asyncio.sleep(0.05)
+            fake.screen = "settings"
+            await asyncio.sleep(0.2)  # as after an action: the picture has settled before the read
+            await c.call_tool("phone_read_screen", {})
+            await asyncio.sleep(1.7)
+            reads = len(fake.called("/source"))
+            r = text(await c.call_tool("phone_tap", {"text": "General"}))
+            check(len(fake.called("/source")) - reads == 1 and "iPhone Storage" in r,
+                  "a read stays good while the picture is unchanged: one read per tap, not two",
+                  (len(fake.called("/source")) - reads, bool(w._frames.fresh()), w._frames.url))
+            fake.screen = "settings"
+            await asyncio.sleep(0.2)
+            await c.call_tool("phone_read_screen", {})
+            fake.screen = "general"  # the screen changes by itself; "General" moves
+            await asyncio.sleep(0.3)
+            await c.call_tool("phone_tap", {"text": "General"})
+            check(fake.called("/wda/tap")[-1] == {"x": 195.0, "y": 71.0},
+                  "a changed picture means a new read before tapping", fake.called("/wda/tap")[-1])
+
+            r = text(await c.call_tool("phone_observe", {"mode": "image"}))
+            check("screenshot" in r, "phone_observe switches modes", r)
+            fake.screen = "settings"
+            await asyncio.sleep(0.2)  # let the new picture arrive, as it would before the agent acts
+            r = await c.call_tool("phone_tap", {"text": "General"})
+            kinds = [getattr(x, "type", "") for x in r.content]
+            check(kinds == ["text", "image"] and "attached" in r.content[0].text,
+                  "image mode: an action returns a screenshot", kinds)
+            await c.call_tool("phone_tap", {"text": "iPhone Storage"})
+            r = await c.call_tool("phone_tap", {"text": "Delete App"})
+            check(r.content[0].text.startswith("Refused"), "image mode keeps the safety check", r.content[0].text[:80])
+            r = await c.call_tool("phone_observe", {"mode": "both"})
+            r = await c.call_tool("phone_go", {"where": "home"})
+            kinds = [getattr(x, "type", "") for x in r.content]
+            check(kinds == ["text", "image"] and "[app] Photos" in r.content[0].text, "both: labels and a screenshot",
+                  kinds)
+            await c.call_tool("phone_observe", {"mode": "text"})
+
+            from PIL import Image as _Image
+            noisy = io.BytesIO()
+            _Image.effect_noise((1170, 2532), 80).convert("RGB").save(noisy, "PNG")
+            w = server.phone.wda
+            w._png = lambda: noisy.getvalue()
+            fake.screen = "canvas"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("[read from pixels] SCORE 120" in r and "has no labels but shows something" in r and "Pause" in r,
+                  "an unlabeled area that shows something is read from pixels and pointed out", r)
+            del w._png
+            fake.screen = "general"
+            r = text(await c.call_tool("phone_read_screen", {}))
+            check("NOTE" not in r, "plain empty background is not flagged", r)
 
             print("frames, marks, recording")
             import time as _t

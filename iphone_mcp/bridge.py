@@ -138,6 +138,8 @@ class Screen:
     taken_at: float = field(default_factory=time.time)
     # an alert the engine read directly (WebDriverAgent); else screen.prompt guesses from layout
     prompt: Any = None
+    # lines for the readout that are not tap targets ("this area has no labels")
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -134,6 +134,7 @@ class Wda:
         self._lock = threading.Lock()
         self._tmp = Path(tempfile.mkdtemp(prefix="iphone-wda-"))
         self._frames: Frames | None = None
+        self._gap_ocr: dict[tuple, list[TextItem]] = {}  # OCR of the last unlabeled area, by frame
 
     # -- connection --------------------------------------------------------
 
@@ -322,6 +323,14 @@ class Wda:
             self._frames = Frames(url)
         return self._frames
 
+    def unchanged_since(self, t: float) -> bool | None:
+        """Whether the picture has stayed the same since time t; None when the live
+        stream is not running (so nothing can be said)."""
+        f = self._frames
+        if f is None or f.fresh(0.5) is None:
+            return None
+        return f.changed < t
+
     def settle(self) -> float:
         """Wait for the screen to stop changing after an action (0.1-1.2 s)."""
         f = self.frames()
@@ -464,34 +473,90 @@ class Wda:
         return scr.Prompt(title=lines[0] if lines else "", message=" ".join(lines[1:]),
                           buttons=[TextItem(b, 1.0, 0, 0, 0, 0, kind="alert") for b in names])
 
-    def _ocr(self, png: bytes, fast: bool = False, timeout: float = 10) -> list[TextItem]:
-        """Read pixels when the tree has nothing (games, video, canvas)."""
+    def _ocr(self, png: bytes, fast: bool = False, timeout: float = 10,
+             region: tuple[float, float, float, float] | None = None) -> list[TextItem]:
+        """Read pixels when the tree has nothing (games, video, canvas). `region` is
+        where `png` sits on the screen (x, y, w, h in points) when it is a crop."""
         f = self._tmp / "screen.img"
         f.write_bytes(png)
         try:
             out = mirrorctl("ocr", f, *(["--fast"] if fast else []), timeout=timeout)
         except (BridgeError, subprocess.TimeoutExpired, ValueError):
             return []
-        w, h = self.phone_size()
-        return [TextItem(o["text"], o["conf"], o["x"] * w, o["y"] * h, o["w"] * w, o["h"] * h)
+        rx, ry, w, h = region or (0.0, 0.0, *self.phone_size())
+        return [TextItem(o["text"], o["conf"], rx + o["x"] * w, ry + o["y"] * h, o["w"] * w, o["h"] * h)
                 for o in out.get("ocr", [])]
 
+    def _unlabeled(self, items: list[TextItem]) -> tuple[list[TextItem], list[str]]:
+        """Part of the screen with no labels but something drawn there (a canvas game,
+        a picture, a video): OCR just that part and say so, so the agent knows to look
+        at a screenshot. Plain background (a half-empty settings page) is left alone."""
+        w, h = self.phone_size()
+        top, bottom = 0.06 * h, 0.96 * h  # status bar, home indicator
+        gaps, y = [], top
+        for a, b in sorted((max(it.y, top), min(it.y + it.h, bottom)) for it in items
+                           if it.y + it.h > top and it.y < bottom):
+            if a - y >= 0.25 * h:
+                gaps.append((y, a))
+            y = max(y, b)
+        if bottom - y >= 0.25 * h:
+            gaps.append((y, bottom))
+        if not gaps:
+            return [], []
+        from PIL import Image, ImageStat
+        try:
+            png = self._png()
+            im = Image.open(io.BytesIO(png)).convert("RGB")
+        except Exception:  # no picture to look at: say nothing rather than fail the read
+            return [], []
+        k = im.width / w
+        frame = hashlib.blake2b(png, digest_size=8).digest()
+        found: list[TextItem] = []
+        notes: list[str] = []
+        for y0, y1 in gaps:
+            crop = im.crop((0, int(y0 * k), im.width, int(y1 * k)))
+            if ImageStat.Stat(crop.convert("L")).stddev[0] < 12:
+                continue
+            key = (frame, round(y0), round(y1))
+            if key not in self._gap_ocr:
+                buf = io.BytesIO()
+                crop.save(buf, "PNG")
+                self._gap_ocr = {key: self._ocr(buf.getvalue(), fast=True, timeout=4, region=(0, y0, w, y1 - y0))}
+            for o in self._gap_ocr[key]:
+                if not any(o.text == i.text for i in items):
+                    found.append(TextItem(o.text, o.conf, o.x, o.y, o.w, o.h, kind="ocr"))
+            notes.append(f"the area from y={y0:.0f} to y={y1:.0f} has no labels but shows something "
+                         f"(a picture, video or drawn game){'; text in it was read from pixels' if found else ''}. "
+                         "Look at it with phone_screenshot.")
+        return found, notes
+
     def capture(self, *, image: bool = True, ocr: bool = True, fast: bool = False,
-                image_width: int | None = None) -> Screen:
+                image_width: int | None = None, alerts: bool = True) -> Screen:
+        """The screen: the tree's labelled items (ocr=True), the picture (image=True).
+        alerts=False skips the SpringBoard alert check (~0.55 s), for reads whose
+        caller checks it separately or does not need it."""
         self.require()
+        t0 = time.time()
         w, h = self.phone_size()
         items: list[TextItem] = []
+        notes: list[str] = []
         prompt = None
         png = None
         if ocr:
             items, prompt = self._items(self._tree())
-            prompt = prompt or self._system_alert()
+            if alerts:
+                prompt = prompt or self._system_alert()
             if len(items) < 3:
                 png = self._png()
                 items += [o for o in self._ocr(png) if not any(o.text == i.text for i in items)]
+            else:
+                extra, notes = self._unlabeled(items)
+                if extra:
+                    items = sorted(items + extra, key=lambda t: (round(t.cy / 6), t.x))
         if image:
             png = png or self._png()
-        s = Screen(w, h, items, self._jpg(png, image_width or int(w)) if image and png else None, prompt=prompt)
+        s = Screen(w, h, items, self._jpg(png, image_width or int(w)) if image and png else None,
+                   taken_at=t0, prompt=prompt, notes=notes)
         if ocr:
             self._last = s
         return s
@@ -518,12 +583,31 @@ class Wda:
             self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
         self._done()
 
-    def tap_many(self, points: list[tuple[float, float]]) -> None:
+    def tap_many(self, points: list[tuple[float, float]], filler: tuple[float, float] | None = None) -> None:
         """Several taps in a row, one request each (~0.6 s per tap). Batching them in
         one W3C actions request does not work on a real phone (iOS 26.4): two taps on
-        one finger register nothing, and one finger per tap drops every second tap."""
-        for x, y in points:
-            self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
+        one finger register nothing, and one finger per tap drops every second finger.
+
+        With `filler`, a point where a stray tap does nothing, the taps go in one
+        request per five with a filler tap in every second slot, so the dropped
+        fingers are the fillers (5 keys in ~1.4 s instead of ~3.2 s)."""
+        if filler is None or len(points) < 2:
+            for x, y in points:
+                self._req("POST", "/wda/tap", {"x": x, "y": y}, session=True)
+            self._done()
+            return
+        hold, gap = 40, 90
+        for i in range(0, len(points), 5):
+            seq: list[tuple[float, float]] = []
+            for j, pt in enumerate(points[i:i + 5]):
+                seq += [filler, pt] if j else [pt]
+            fingers = [{"type": "pointer", "id": f"finger{n + 1}", "parameters": {"pointerType": "touch"},
+                        "actions": ([{"type": "pause", "duration": n * (hold + gap)}] if n else []) + [
+                            {"type": "pointerMove", "duration": 0, "x": round(x), "y": round(y)},
+                            {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": hold},
+                            {"type": "pointerUp", "button": 0}]}
+                       for n, (x, y) in enumerate(seq)]
+            self._req("POST", "/actions", {"actions": fingers}, session=True, timeout=60)
         self._done()
 
     def drag(self, x1: float, y1: float, x2: float, y2: float, *, ms: float = 300, hold_ms: float = 30) -> None:

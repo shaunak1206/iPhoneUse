@@ -55,6 +55,9 @@ SCREENS = {
     "maps": app(node("SearchField", "", (20, 760, 350, 40), placeholderValue="Search Maps")),
     "login": app(node("TextField", "Email", (20, 300, 350, 44)), node("SecureTextField", "Password", (20, 360, 350, 44))),
     "game": app(),
+    # a canvas game inside a page: a few labelled controls, the play area drawn without labels
+    "canvas": app(node("StaticText", "Level 3", (150, 60, 90, 22)), node("Button", "Pause", (20, 770, 60, 40)),
+                  node("Button", "Restart", (165, 770, 60, 40)), node("Button", "Menu", (310, 770, 60, 40))),
     "web": app(node("StaticText", "Example Domain", (120, 200, 150, 22))),
     "ad": app(node("StaticText", "ADVERTISEMENT", (140, 110, 110, 18)),
               node("StaticText", "Skip ad in 2 seconds", (230, 740, 140, 18))),
@@ -155,9 +158,18 @@ class FakeWda:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-        # MJPEG like WDA's :9100 — the picture changes for `moving` frames, then holds still
+        # MJPEG like WDA's :9100: the picture follows the screen (and any system alert), and
+        # flickers for `moving` frames after an action before it holds still
         self.moving = 0
-        frames = [_jpeg(40), _jpeg(200)]
+        shades: dict[tuple, bytes] = {}
+
+        def still() -> bytes:
+            key = (fake.screen, bool(fake.sysalert))
+            if key not in shades:
+                shades[key] = _jpeg(30 + 9 * len(shades))
+            return shades[key]
+
+        flicker = _jpeg(250)
 
         class M(BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -170,7 +182,7 @@ class FakeWda:
                 i = 0
                 try:
                     while True:
-                        f = frames[i % 2] if fake.moving > 0 else frames[0]
+                        f = flicker if fake.moving > 0 and i % 2 else still()
                         fake.moving = max(0, fake.moving - 1)
                         self.wfile.write(b"--BoundaryString\r\nContent-type: image/jpeg\r\nContent-Length: "
                                          + str(len(f)).encode() + b"\r\n\r\n" + f + b"\r\n\r\n")
@@ -269,17 +281,22 @@ class FakeWda:
             self.shut = True
             return 200, "Shutting down"
         if path == "/actions":
-            x = y = 0.0
-            for a in body["actions"][0]["actions"]:
-                if a["type"] == "pointerMove":
-                    x, y = a["x"], a["y"]
-                elif a["type"] == "pointerDown":
-                    down = (x, y)
-                elif a["type"] == "pointerUp" and (x, y) == down:  # a tap, not a drag
-                    t = self._hit(x, y)
-                    self.pressed.append(t or "")
-                    if (nxt := TAPS.get((self.screen, t))):
-                        self.screen = nxt
+            fingers = body["actions"]
+            if len(fingers) > 1:  # a real phone (iOS 26.4) drops every second finger of a multi-finger request
+                fingers = fingers[::2]
+            for finger in fingers:
+                x = y = 0.0
+                down = None
+                for a in finger["actions"]:
+                    if a["type"] == "pointerMove":
+                        x, y = a["x"], a["y"]
+                    elif a["type"] == "pointerDown":
+                        down = (x, y)
+                    elif a["type"] == "pointerUp" and (x, y) == down:  # a tap, not a drag
+                        t = self._hit(x, y)
+                        self.pressed.append(t or "")
+                        if (nxt := TAPS.get((self.screen, t))):
+                            self.screen = nxt
             return 200, None
         if path == "/wda/keyboard/dismiss":
             return 200, None

@@ -84,6 +84,13 @@ class Phone:
         self._installed: dict[str, str] | None = None
         self.activity: deque[dict] = deque(maxlen=200)
         self.marks: list[screen.TextItem] = []  # from the last marked screenshot, for tap "#n"
+        # What actions report: "text" (labels with tap points), "image" (the live frame), or "both".
+        self.observe = os.environ.get("IPHONE_OBSERVE", "text")
+        # Long-lived front ends (the MCP server) set this: slow checks run in the background
+        # between calls instead of before a readout returns.
+        self.background = False
+        self._pending: asyncio.Task | None = None
+        self._tasks: set[asyncio.Task] = set()
 
     # -- plumbing ----------------------------------------------------------
 
@@ -125,24 +132,113 @@ class Phone:
         except OSError:
             pass
 
-    async def read(self, image: bool = False, settle: float = 0.0) -> Screen:
+    async def read(self, image: bool = False, settle: float = 0.0, alerts: bool = True) -> Screen:
+        """alerts=False skips WebDriverAgent's SpringBoard alert check (~0.55 s of a
+        ~1 s read): for polling and recipes, where nothing new is being decided."""
         if settle:
             await asyncio.sleep(settle)
-        return await self.io(self.eng().capture, image=image, ocr=True)
+        e = self.eng()
+        return await self.io(e.capture, image=image, ocr=True, **({"alerts": alerts} if isinstance(e, Wda) else {}))
 
-    async def after(self, action: str, settle: float | None = None) -> str:
+    async def _settle_after(self, settle: float | None) -> None:
         if settle is None:
             await self.settle_screen()
         elif settle:
             await asyncio.sleep(settle)
-        s = await self.read()
+
+    async def after(self, action: str, settle: float | None = None) -> str:
+        await self._settle_after(settle)
+        e = self.eng()
+        if self.background and isinstance(e, Wda):
+            # Return the labels now and look for a system alert while the agent thinks;
+            # the next tap waits for that answer (_caught_up) before it acts.
+            s = await self.read(alerts=False)
+            if s.prompt is None:
+                self._later(self._surprise_alert(e, s))
+        else:
+            s = await self.read()
         return f"{action}\n\n{screen.describe(s)}"
 
+    async def after_image(self, action: str, settle: float | None = None) -> tuple[str, bytes]:
+        """The action line and a picture of the screen that followed (free from the
+        live stream). The labels are read in the background for the next tap's safety
+        check, so the picture comes back without waiting for them."""
+        await self._settle_after(settle)
+        e = self.eng()
+        if isinstance(e, Wda):
+            jpg = await asyncio.to_thread(lambda: e._jpg(e._png(), int(e.phone_size()[0])))
+            if self.background:
+                self._later(self._prefetch())
+        else:
+            s = await self.io(e.capture, image=True, ocr=False)
+            assert s.jpg is not None
+            jpg = s.jpg
+        return (f"{action}\n\nThe screen that followed is attached (1 image pixel = 1 phone point). "
+                "phone_read_screen lists its labels and tap points."), jpg
+
+    def _later(self, coro) -> None:
+        """Run coro in the background; the next action that taps waits for it."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        self._pending = task
+
+    async def _surprise_alert(self, e: Wda, s: Screen) -> screen.Prompt | None:
+        p = await self.io(e._system_alert)
+        if p is not None:
+            s.prompt = p  # the cached screen now carries it, for the guard
+        return p
+
+    async def _prefetch(self) -> None:
+        await self.read()
+
+    def _ours(self, task: asyncio.Task | None) -> asyncio.Task | None:
+        """The task if it belongs to the running event loop. A task left over from a
+        loop that has closed (asyncio.run called again in one process) never finishes."""
+        return task if task is not None and task.get_loop() is asyncio.get_running_loop() else None
+
+    async def idle(self) -> None:
+        """Wait until background checks are done (before another event loop uses this
+        Phone, or before stopping)."""
+        while live := [t for t in self._tasks if not t.done() and self._ours(t)]:
+            await asyncio.gather(*live, return_exceptions=True)
+        self._tasks = {t for t in self._tasks if not t.done() and self._ours(t)}
+
+    async def _drain(self) -> None:
+        """Finish any background check without acting on what it found."""
+        task, self._pending = self._ours(self._pending), None
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass
+
+    async def _caught_up(self) -> None:
+        """Before resolving a tap: finish the background check, and stop if it found a
+        system alert the agent was not shown (a tap could land on its buttons)."""
+        task, self._pending = self._ours(self._pending), None
+        if task is None:
+            return
+        try:
+            found = await task
+        except Exception:
+            return
+        if found is not None:
+            raise Refused("A system prompt came up after the last action, so nothing was tapped.\n\n"
+                          + found.describe())
+
     async def fresh(self, max_age: float = 1.5) -> Screen:
-        """The last screen read if nothing acted since and it is recent, else a new read."""
-        s = self.eng().last
-        if s is not None and time.time() - s.taken_at < max_age:
-            return s
+        """The last screen read, if it still shows what is on the phone; else a new read.
+        With the live stream running that is exact (the picture has not changed since
+        the read began), so a read made before the agent stopped to think stays good;
+        without it, a read younger than max_age."""
+        await self._caught_up()
+        e = self.eng()
+        s = e.last
+        if s is not None:
+            same = e.unchanged_since(s.taken_at) if isinstance(e, Wda) else None
+            if same or (same is None and time.time() - s.taken_at < max_age):
+                return s
         return await self.read()
 
     async def installed_bundle(self, name: str) -> str | None:
@@ -171,6 +267,7 @@ class Phone:
                                  f"({len(self.marks)} marks now)")
             it = self.marks[n - 1]
             return it.cx, it.cy, [it], f"#{n} '{it.text}' at ({it.cx:.0f},{it.cy:.0f})", None
+        await self._caught_up()
         if text:
             s = await self.fresh()
             hits = screen.find(s, text, exact=exact)
@@ -186,7 +283,7 @@ class Phone:
             return it.cx, it.cy, [it], f"'{it.text}' at ({it.cx:.0f},{it.cy:.0f})", screen.prompt(s)
         if x is None or y is None:
             raise ValueError("give x and y, or text")
-        s = self.eng().last or await self.read()
+        s = await self.fresh() if isinstance(self.eng(), Wda) else (self.eng().last or await self.read())
         return x, y, screen.at(s, x, y), f"({x:.0f},{y:.0f})", screen.prompt(s)
 
     @staticmethod
@@ -459,6 +556,7 @@ class Phone:
         return self._did(f"Went to Settings > {place}.")
 
     async def alert(self, button: str, confirm: bool = False) -> str:
+        await self._drain()
         s = await self.read()
         p = screen.prompt(s)
         if not p:
@@ -481,7 +579,7 @@ class Phone:
     async def wait_for(self, text: str, timeout: float = 15) -> str:
         end = time.time() + min(timeout, 60)
         while True:
-            s = await self.read()
+            s = await self.read(alerts=False)
             hits = screen.find(s, text)
             if hits:
                 h = hits[0]
@@ -496,7 +594,7 @@ class Phone:
 
     async def find(self, text: str, scroll: bool = False, max_scrolls: int = 8, direction: str = "down") -> str:
         for i in range(max_scrolls + 1 if scroll else 1):
-            s = await self.read(settle=0.3 if i else 0)
+            s = await self.read(settle=0.3 if i else 0, alerts=False)
             hits = screen.find(s, text)
             if hits:
                 found = "; ".join(f"({h.cx:.0f},{h.cy:.0f}) {h.text}" for h in hits[:8])
@@ -506,7 +604,7 @@ class Phone:
                 break
             before = [it.text for it in s.items]
             await self.scroll(direction, 0.6)
-            after = await self.read(settle=0.3)
+            after = await self.read(settle=0.3, alerts=False)
             if [it.text for it in after.items] == before:
                 raise ValueError(f"{text!r} not found; reached the end of the view.\n\n{screen.describe(after)}")
         raise ValueError(f"{text!r} not found.\n\n{screen.describe(self.eng().last or await self.read())}")
@@ -532,11 +630,11 @@ class Phone:
         await self._tap_points([(x, y) for x, y, _ in points])
         return self._did("Tapped " + ", ".join(f"'{lbl}'" for _, _, lbl in points) + ".")
 
-    async def _tap_points(self, points: list[tuple[float, float]]) -> None:
-        """Tap in order, without a screen read between taps."""
+    async def _tap_points(self, points: list[tuple[float, float]], filler: tuple[float, float] | None = None) -> None:
+        """Tap in order, without a screen read between taps. `filler`: see Wda.tap_many."""
         e = self.eng()
         if isinstance(e, Wda) and len(points) > 1:
-            await self.io(e.tap_many, points)
+            await self.io(e.tap_many, points, filler)
         else:
             for x, y in points:
                 await self.io(e.tap, x, y)
@@ -552,10 +650,12 @@ class Phone:
                 raise
             return resolve(await self.read())
 
-    async def keys(self, keys: str | list[str]) -> str:
+    async def keys(self, keys: str | list[str], filler: tuple[float, float] | None = None) -> str:
         """Type on an on-screen keyboard drawn by the app or page (games like Wordle,
         PIN-less keypads): "crane" taps c, r, a, n, e; a list may add named keys like
-        "enter" or "backspace". One screen read, then every tap back to back."""
+        "enter" or "backspace". One screen read, then every tap back to back.
+        `filler` (a point where a stray tap does nothing) sends them faster; check the
+        result, since a dropped key is possible (Wda.tap_many)."""
         seq = list(keys) if isinstance(keys, str) else keys
 
         def resolve(s: Screen) -> list[tuple[float, float]]:
@@ -570,7 +670,7 @@ class Phone:
             return out
 
         points = await self._from_screen(resolve)
-        await self._tap_points(points)
+        await self._tap_points(points, filler)
         return self._did(f"Pressed {''.join(k if len(k) == 1 else f' [{k}] ' for k in seq).strip()} on the on-screen keys.")
 
     async def dismiss(self, rounds: int = 4, wait_ads: float = 12) -> str:
@@ -612,6 +712,7 @@ class Phone:
         return " ".join(done) if done else "Nothing to dismiss."
 
     def _did(self, line: str) -> str:
+        self._pending = None  # a background check was about the screen before this action
         self.record(line)
         return line
 
